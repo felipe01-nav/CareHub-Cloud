@@ -1,40 +1,10 @@
-name: ClientAPI Check
-
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    types: [ opened, synchronize, reopened ]
-    branches: [ main ]
-
+# CareHub: this upstream AppFlowy workflow is switched off (it needs AppFlowy's
+# own secrets/servers and would waste our free Actions minutes).
+# The original is in the upstream AppFlowy repository history.
+name: "Disabled upstream workflow (client_api_check.yml)"
+on: workflow_dispatch
 jobs:
-  test:
+  disabled:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            AppFlowy-Cloud
-
-      - name: Install cargo-tree
-        run: cargo install cargo-tree
-
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-
-      - name: install prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install protobuf-compiler
-
-      - name: Build ClientAPI
-        working-directory: ./libs/client-api
-        run: cargo build --features "enable_brotli"
-
-      - name: Check ClientAPI Dependencies
-        working-directory: ./libs/client-api
-        run: bash ../../script/client_api_deps_check.sh
-
+      - run: echo "Disabled in CareHub"

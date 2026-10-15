@@ -8,7 +8,7 @@
 FROM lukemathwalker/cargo-chef:latest-rust-1.86 AS chef
 WORKDIR /app
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends lld clang protobuf-compiler \
+  && apt-get install -y --no-install-recommends lld clang protobuf-compiler libprotobuf-dev \
   && rm -rf /var/lib/apt/lists/*
 
 FROM chef AS planner
@@ -50,3 +50,4 @@ COPY --from=builder /out/appflowy_cloud /usr/local/bin/appflowy_cloud
 ENV PORT=8000
 EXPOSE 8000
 CMD ["appflowy_cloud"]
+

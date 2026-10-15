@@ -1,10 +1,17 @@
-# CareHub: this upstream AppFlowy workflow is switched off (it needs AppFlowy's
-# own secrets/servers and would waste our free Actions minutes).
-# The original is in the upstream AppFlowy repository history.
-name: "Disabled upstream workflow (audit.yml)"
-on: workflow_dispatch
+name: Security audit
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
 jobs:
-  disabled:
+  security_audit:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Disabled in CareHub"
+      - uses: actions/checkout@v3
+      - uses: taiki-e/install-action@cargo-deny
+      - name: Scan for vulnerabilities
+        run:
+          cargo deny check advisories

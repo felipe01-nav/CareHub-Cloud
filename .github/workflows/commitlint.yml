@@ -1,10 +1,12 @@
-# CareHub: this upstream AppFlowy workflow is switched off (it needs AppFlowy's
-# own secrets/servers and would waste our free Actions minutes).
-# The original is in the upstream AppFlowy repository history.
-name: "Disabled upstream workflow (commitlint.yml)"
-on: workflow_dispatch
+name: Lint Commit Messages
+on: [pull_request, push]
+
 jobs:
-  disabled:
+  commitlint:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Disabled in CareHub"
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@v4
+

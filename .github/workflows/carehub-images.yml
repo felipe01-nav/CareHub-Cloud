@@ -1,0 +1,89 @@
+# CareHub: builds the server + worker images from this repository's source code
+# and stores them privately in GitHub Packages (ghcr.io).
+name: CareHub - build server images
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "carehub/**"
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: carehub-server-images
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Free disk space (the Rust build is large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push carehub-server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/carehub/server.Dockerfile
+          target: server
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/felipe01-nav/carehub-server:latest
+            ghcr.io/felipe01-nav/carehub-server:${{ github.sha }}
+          cache-from: type=gha,scope=carehub-rust
+          cache-to: type=gha,mode=max,scope=carehub-rust,ignore-error=true
+
+      - name: Build and push carehub-worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/carehub/server.Dockerfile
+          target: worker
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/felipe01-nav/carehub-worker:latest
+            ghcr.io/felipe01-nav/carehub-worker:${{ github.sha }}
+          cache-from: type=gha,scope=carehub-rust
+
+      - name: Keep only the 2 newest server images (saves storage)
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: carehub-server
+          package-type: container
+          min-versions-to-keep: 2
+
+      - name: Keep only the 2 newest worker images (saves storage)
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: carehub-worker
+          package-type: container
+          min-versions-to-keep: 2

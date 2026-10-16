@@ -42,6 +42,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
   super::carehub_icloud::configure(cfg);
   // CareHub: Messages (direct and group chats) – see carehub_messages.rs
   super::carehub_messages::configure(cfg);
+  // CareHub: Claude (AI writer, AI chat, AI fields) – see carehub_ai.rs
+  super::carehub_ai::configure(cfg);
   cfg
     .service(
       web::resource("/api/workspace/{workspace_id}/view/{view_id}")
@@ -812,7 +814,8 @@ async fn upgrade_database_container_status_handler(
 // ---------------------------------------------------------------------------
 
 /// GET /api/server-info (no sign-in needed)
-/// Tells the web app which optional features this server offers. Connections
+/// Tells the web app which optional features this server offers. AI is on
+/// when a Claude key is set (see carehub_ai.rs). Connections
 /// to outside services (Google Drive and similar) are not offered.
 async fn server_info_handler(req: HttpRequest) -> ActixResult<Json<AppResponse<Value>>> {
   let platform = req
@@ -826,7 +829,7 @@ async fn server_info_handler(req: HttpRequest) -> ActixResult<Json<AppResponse<V
   Ok(Json(AppResponse::Ok().with_data(json!({
     "enable_page_history": false,
     "enable_database_history": false,
-    "ai_enabled": false,
+    "ai_enabled": super::carehub_ai::is_enabled(),
     "self_hosted": true,
   }))))
 }
@@ -874,6 +877,6 @@ async fn usage_and_limit_handler(
     "ai_responses_count": 0,
     "ai_responses_count_limit": 0,
     "local_ai": false,
-    "ai_responses_unlimited": false,
+    "ai_responses_unlimited": super::carehub_ai::is_enabled(),
   }))))
 }

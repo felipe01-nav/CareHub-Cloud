@@ -3,7 +3,8 @@
 # Everything here is either built from our own private source code
 # (carehub-server, carehub-worker, carehub-web) or is a standard open-source
 # image (postgres, redis, minio, nginx, supabase/auth).
-# No commercial AppFlowy images, no AI and no search services.
+# No commercial AppFlowy images and no search services. AI (Claude) is optional:
+# set CAREHUB_ANTHROPIC_API_KEY in .env to switch it on.
 #
 # First time:   sh setup.sh            (creates .env with random passwords)
 # Start:        docker compose up -d
@@ -80,7 +81,7 @@ services:
       - GOTRUE_DB_NAMESPACE=auth
       - GOTRUE_SITE_URL=${CAREHUB_URL:-http://localhost}
       - GOTRUE_URI_ALLOW_LIST=${CAREHUB_URL:-http://localhost}/**,http://localhost/**
-      - GOTRUE_DISABLE_SIGNUP=false
+      - GOTRUE_DISABLE_SIGNUP=true
       - GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET:?Run "sh setup.sh" first}
       - GOTRUE_JWT_EXP=604800
       - GOTRUE_JWT_AUD=authenticated
@@ -141,7 +142,7 @@ services:
       - APPFLOWY_MAILER_SMTP_EMAIL=noreply@carehub.local
       - APPFLOWY_MAILER_SMTP_PASSWORD=unused
       - APPFLOWY_MAILER_SMTP_TLS_KIND=wrapper
-      # AI and search are switched off.
+      # Search is switched off. AI uses Claude when CAREHUB_ANTHROPIC_API_KEY is set.
       - AI_ENABLED=false
       - AI_SERVER_HOST=localhost
       - AI_SERVER_PORT=5001
@@ -150,6 +151,11 @@ services:
       - APPFLOWY_SEARCH_SERVICE_URL=http://localhost:4002
       # Who may manage sign-in accounts (Settings > User accounts). Comma separated.
       - CAREHUB_ADMIN_EMAILS=${CAREHUB_ADMIN_EMAILS:-}
+      # Encrypts saved iCloud passwords.
+      - CAREHUB_SECRET_KEY=${CAREHUB_SECRET_KEY:-}
+      # Claude (Anthropic API key) for the AI features, and optionally the model.
+      - CAREHUB_ANTHROPIC_API_KEY=${CAREHUB_ANTHROPIC_API_KEY:-}
+      - CAREHUB_AI_MODEL=${CAREHUB_AI_MODEL:-}
     healthcheck:
       test: "curl --fail http://127.0.0.1:8000/health || exit 1"
       interval: 5s

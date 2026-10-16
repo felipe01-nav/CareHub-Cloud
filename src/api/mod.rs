@@ -1,6 +1,7 @@
 pub mod access_request;
 pub mod ai;
 pub mod carehub_admin;
+pub mod carehub_calendar;
 pub mod carehub_compat;
 pub mod carehub_forms;
 pub mod chat;

@@ -12,7 +12,7 @@ use crate::api::util::realtime_user_for_web_request;
 use crate::biz;
 use crate::biz::authentication::jwt::UserUuid;
 use crate::biz::workspace::ops::get_workspace_mentionable_person;
-use crate::biz::workspace::page_view::update_space;
+use crate::biz::workspace::page_view::{create_space, update_space};
 use crate::state::AppState;
 use actix_web::web::{self, Data, Json};
 use actix_web::HttpRequest;
@@ -105,6 +105,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/workspace/{workspace_id}/notifications/{action}")
         .route(web::post().to(notifications_action_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/spaces")
+        .route(web::post().to(create_structured_space_handler)),
     )
     .service(
       web::resource("/api/workspace/{workspace_id}/spaces/{space_id}")
@@ -644,6 +648,68 @@ fn extra_str(extra: &Option<Value>, key: &str) -> String {
     .and_then(|v| v.as_str())
     .unwrap_or_default()
     .to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateStructuredSpaceBody {
+  name: Option<String>,
+  space_icon: Option<String>,
+  space_icon_color: Option<String>,
+  view_id: Option<Uuid>,
+  permission: Option<Value>,
+}
+
+/// POST /api/workspace/{workspace_id}/spaces
+/// "Create new space" in the sidebar. The newer web app sends detailed
+/// sharing settings; this server only knows "everyone" or "private", so the
+/// visibility is kept and the other settings follow the workspace roles.
+async fn create_structured_space_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
+  body: Json<CreateStructuredSpaceBody>,
+  state: Data<AppState>,
+  req: HttpRequest,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let workspace_id = workspace_id.into_inner();
+  let body = body.into_inner();
+  let role = workspace_role(&state, &user_uuid, &workspace_id).await?;
+  if matches!(role, AFRole::Guest) {
+    return Err(AppError::NotEnoughPermissions.into());
+  }
+  let is_private = body
+    .permission
+    .as_ref()
+    .and_then(|p| p.get("visibility"))
+    .and_then(|v| v.as_str())
+    .map(|v| v.eq_ignore_ascii_case("private"))
+    .unwrap_or(false);
+  let permission = if is_private {
+    SpacePermission::Private
+  } else {
+    SpacePermission::PublicToAll
+  };
+  let name = body
+    .name
+    .filter(|n| !n.trim().is_empty())
+    .unwrap_or_else(|| "New space".to_string());
+  let icon = body.space_icon.unwrap_or_default();
+  let color = body.space_icon_color.unwrap_or_default();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let user = realtime_user_for_web_request(req.headers(), uid)?;
+  let space = create_space(
+    &state,
+    user,
+    workspace_id,
+    &permission,
+    &name,
+    &icon,
+    &color,
+    body.view_id,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok().with_data(
+    json!({ "view_id": space.view_id.to_string() }),
+  )))
 }
 
 /// PATCH /api/workspace/{workspace_id}/spaces/{space_id}

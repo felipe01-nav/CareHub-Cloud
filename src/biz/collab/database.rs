@@ -41,6 +41,14 @@ pub fn resolve_dependencies_when_create_database_linked_view(
     DatabaseLayout::Grid => resolve_grid_dependencies(fields),
     DatabaseLayout::Board => resolve_board_dependencies(fields),
     DatabaseLayout::Calendar => resolve_calendar_dependencies(fields),
+    // CareHub: the newer view types (Form, List, Gallery, ...) need no extra
+    // fields; the web app stores their own settings in the view itself.
+    other => Ok(LinkedViewDependencies {
+      layout_settings: LayoutSettings::default(),
+      field_settings: default_field_settings_for_fields(fields, other),
+      group_settings: vec![],
+      deps_fields: vec![],
+    }),
   }
 }
 

@@ -2,93 +2,76 @@ chef exit 0
 server exit 101
 worker exit 0
 == server errors ==
-  Downloaded thiserror-impl v1.0.69
-  Downloaded thiserror-impl v2.0.12
-  Downloaded thiserror v2.0.12
-  Downloaded proc-macro-error2 v2.0.1
-  Downloaded proc-macro-error-attr2 v2.0.0
-  Downloaded thiserror v1.0.69
-   Compiling thiserror v2.0.12
-   Compiling thiserror-impl v2.0.12
-   Compiling thiserror v1.0.69
-   Compiling thiserror-impl v1.0.69
-   Compiling proc-macro-error-attr2 v2.0.0
-   Compiling proc-macro-error2 v2.0.1
     Checking app-error v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/app-error)
-src/biz/workspace/page_view.rs:1704:28: error[E0004]: non-exhaustive patterns: `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered: patterns `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered
-src/biz/workspace/page_view.rs:1986:32: error[E0004]: non-exhaustive patterns: `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered: patterns `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered
-src/biz/collab/database.rs:40:9: error[E0004]: non-exhaustive patterns: `DatabaseLayout::Chart`, `DatabaseLayout::List`, `DatabaseLayout::Gallery` and 3 more not covered: patterns `DatabaseLayout::Chart`, `DatabaseLayout::List`, `DatabaseLayout::Gallery` and 3 more not covered
-src/biz/collab/folder_view.rs:498:9: error[E0004]: non-exhaustive patterns: `&collab_folder::ViewLayout::Chart`, `&collab_folder::ViewLayout::List`, `&collab_folder::ViewLayout::Gallery` and 3 more not covered: patterns `&collab_folder::ViewLayout::Chart`, `&collab_folder::ViewLayout::List`, `&collab_folder::ViewLayout::Gallery` and 3 more not covered
-error: could not compile `appflowy-cloud` (lib) due to 4 previous errors
+src/api/carehub_forms.rs:1220:11: error[E0277]: the trait bound `anyhow::Error: actix_web::ResponseError` is not satisfied: the trait `actix_web::ResponseError` is not implemented for `anyhow::Error`
+error: could not compile `appflowy-cloud` (lib) due to 1 previous error; 1 warning emitted
 == server tail ==
-    Checking lettre v0.11.16
+      Adding collab-document v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-document)
+      Adding collab-entity v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-entity)
+      Adding collab-folder v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-folder)
+      Adding collab-importer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-importer)
+      Adding collab-plugins v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-plugins)
+      Adding collab-user v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-user)
+   Compiling collab-entity v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-entity)
+    Checking collab v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab)
+    Checking appflowy-ai-client v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/appflowy-ai-client)
+    Checking app-error v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/app-error)
+    Checking infra v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/infra)
+   Compiling appflowy-proto v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/appflowy-proto)
+    Checking database-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/database-entity)
+   Compiling tonic-proto v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/tonic-proto)
+    Checking gotrue-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/gotrue-entity)
+    Checking shared-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/shared-entity)
+    Checking collab-document v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-document)
+    Checking collab-folder v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-folder)
+   Compiling collab-rt-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/collab-rt-entity)
+    Checking collab-database v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-database)
+    Checking database v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/database)
+vendor/appflowy-collab/collab-database/src/rows/row.rs:30:22: warning: unused import: `trace`
+warning: `collab-database` (lib) generated 1 warning (run `cargo fix --lib -p collab-database` to apply 1 suggestion)
+    Checking collab-rt-protocol v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/collab-rt-protocol)
     Checking collab-stream v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/collab-stream)
-    Checking indexer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/indexer)
-    Checking brotli v3.5.0
-    Checking async_zip v0.0.17
-    Checking actix-session v0.8.0
-    Checking handlebars v5.1.2
-    Checking access-control v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/access-control)
-    Checking matchers v0.1.0
-    Checking actix-web-actors v4.3.1+deprecated
-    Checking tungstenite v0.26.2
-    Checking fxhash v0.2.1
-    Checking sharded-slab v0.1.7
-    Checking sanitize-filename v0.5.0
-    Checking tracing-serde v0.2.0
-    Checking tracing-log v0.2.0
-    Checking serde_plain v1.0.2
-   Compiling async-recursion v1.1.1
-    Checking thread_local v1.1.8
-    Checking tracing-subscriber v0.3.19
     Checking collab-importer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-importer)
-    Checking actix-multipart v0.7.2
-    Checking tokio-tungstenite v0.26.2
-    Checking appflowy-collaborate v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/services/appflowy-collaborate)
     Checking mailer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/mailer)
-    Checking actix-identity v0.6.0
+    Checking indexer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/indexer)
+    Checking access-control v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/access-control)
     Checking llm-client v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/llm-client)
+    Checking appflowy-collaborate v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/services/appflowy-collaborate)
     Checking workspace-template v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/workspace-template)
     Checking gotrue v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/gotrue)
-    Checking fancy-regex v0.11.0
     Checking collab-user v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-user)
-    Checking itertools v0.11.0
-    Checking md5 v0.7.0
     Checking snowflake v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/snowflake)
     Checking appflowy-cloud v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud)
-src/biz/workspace/page_view.rs:1704:28: error[E0004]: non-exhaustive patterns: `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered: patterns `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered
-src/biz/workspace/page_view.rs:1986:32: error[E0004]: non-exhaustive patterns: `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered: patterns `collab_folder::ViewLayout::Chart`, `collab_folder::ViewLayout::List`, `collab_folder::ViewLayout::Gallery` and 3 more not covered
-src/biz/collab/database.rs:40:9: error[E0004]: non-exhaustive patterns: `DatabaseLayout::Chart`, `DatabaseLayout::List`, `DatabaseLayout::Gallery` and 3 more not covered: patterns `DatabaseLayout::Chart`, `DatabaseLayout::List`, `DatabaseLayout::Gallery` and 3 more not covered
-src/biz/collab/folder_view.rs:498:9: error[E0004]: non-exhaustive patterns: `&collab_folder::ViewLayout::Chart`, `&collab_folder::ViewLayout::List`, `&collab_folder::ViewLayout::Gallery` and 3 more not covered: patterns `&collab_folder::ViewLayout::Chart`, `&collab_folder::ViewLayout::List`, `&collab_folder::ViewLayout::Gallery` and 3 more not covered
-error: could not compile `appflowy-cloud` (lib) due to 4 previous errors
+src/api/carehub_forms.rs:1220:11: error[E0277]: the trait bound `anyhow::Error: actix_web::ResponseError` is not satisfied: the trait `actix_web::ResponseError` is not implemented for `anyhow::Error`
+src/api/carehub_forms.rs:38:24: warning: unused import: `CollabStore`
+warning: `appflowy-cloud` (lib) generated 1 warning
+error: could not compile `appflowy-cloud` (lib) due to 1 previous error; 1 warning emitted
 == worker errors ==
-  Downloaded serde_path_to_error v0.1.17
-    Checking serde_path_to_error v0.1.17
     Checking app-error v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/app-error)
 == worker tail ==
+    Checking collab v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab)
+    Checking appflowy-ai-client v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/appflowy-ai-client)
+    Checking infra v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/infra)
+   Compiling appflowy-proto v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/appflowy-proto)
+    Checking database-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/database-entity)
+   Compiling tonic-proto v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/tonic-proto)
+    Checking app-error v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/app-error)
+    Checking gotrue-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/gotrue-entity)
+    Checking collab-document v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-document)
+    Checking shared-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/shared-entity)
    Compiling collab-rt-entity v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/collab-rt-entity)
-    Checking raw-cpuid v11.5.0
-    Checking tiktoken-rs v0.6.0
-    Checking quanta v0.12.5
-    Checking casbin v2.10.1
-    Checking pbkdf2 v0.11.0
-    Checking aes v0.8.4
     Checking collab-folder v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-folder)
     Checking collab-rt-protocol v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/collab-rt-protocol)
-    Checking governor v0.6.3
-    Checking zip v0.6.6
+    Checking database v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/database)
     Checking collab-database v0.2.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-database)
-    Checking lettre v0.11.16
 vendor/appflowy-collab/collab-database/src/rows/row.rs:30:22: warning: unused import: `trace`
-    Checking collab-stream v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/collab-stream)
-    Checking async_zip v0.0.17
-    Checking indexer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/indexer)
 warning: `collab-database` (lib) generated 1 warning (run `cargo fix --lib -p collab-database` to apply 1 suggestion)
-    Checking access-control v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/access-control)
-    Checking actix-web-actors v4.3.1+deprecated
+    Checking collab-stream v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/collab-stream)
     Checking collab-importer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/vendor/appflowy-collab/collab-importer)
     Checking mailer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/mailer)
+    Checking indexer v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/indexer)
+    Checking access-control v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/libs/access-control)
     Checking appflowy-collaborate v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/services/appflowy-collaborate)
     Checking appflowy-worker v0.1.0 (/home/runner/work/CareHub-Cloud/CareHub-Cloud/services/appflowy-worker)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 15s
-commit 09f3520e7f6f5d8f66fb195d701b5f255ce1573b
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.83s
+commit 2b19dbde5a5ea881c2b4fbbe9f5065ef3d844a4c

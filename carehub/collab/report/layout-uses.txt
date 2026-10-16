@@ -1,23 +1,35 @@
 src/biz/collab/database.rs:41:    DatabaseLayout::Grid => resolve_grid_dependencies(fields),
 src/biz/collab/database.rs:42:    DatabaseLayout::Board => resolve_board_dependencies(fields),
 src/biz/collab/database.rs:43:    DatabaseLayout::Calendar => resolve_calendar_dependencies(fields),
-src/biz/collab/database.rs:50:    field_settings: default_field_settings_for_fields(fields, DatabaseLayout::Grid),
-src/biz/collab/database.rs:59:  let database_layout = DatabaseLayout::Board;
-src/biz/collab/database.rs:127:  let database_layout = DatabaseLayout::Calendar;
-src/biz/collab/database.rs:272:    let database_layout = DatabaseLayout::Grid;
-src/biz/collab/database.rs:288:    let database_layout = DatabaseLayout::Board;
-src/biz/collab/database.rs:331:    let database_layout = DatabaseLayout::Calendar;
-src/biz/collab/database.rs:350:      .get(&DatabaseLayout::Calendar)
+src/biz/collab/database.rs:58:    field_settings: default_field_settings_for_fields(fields, DatabaseLayout::Grid),
+src/biz/collab/database.rs:67:  let database_layout = DatabaseLayout::Board;
+src/biz/collab/database.rs:135:  let database_layout = DatabaseLayout::Calendar;
+src/biz/collab/database.rs:280:    let database_layout = DatabaseLayout::Grid;
+src/biz/collab/database.rs:296:    let database_layout = DatabaseLayout::Board;
+src/biz/collab/database.rs:339:    let database_layout = DatabaseLayout::Calendar;
+src/biz/collab/database.rs:358:      .get(&DatabaseLayout::Calendar)
 src/biz/collab/folder_view.rs:499:    CollabFolderViewLayout::Document => ViewLayout::Document,
 src/biz/collab/folder_view.rs:500:    CollabFolderViewLayout::Grid => ViewLayout::Grid,
 src/biz/collab/folder_view.rs:501:    CollabFolderViewLayout::Board => ViewLayout::Board,
 src/biz/collab/folder_view.rs:502:    CollabFolderViewLayout::Calendar => ViewLayout::Calendar,
 src/biz/collab/folder_view.rs:503:    CollabFolderViewLayout::Chat => ViewLayout::Chat,
-src/biz/collab/folder_view.rs:533:    ViewLayout::Document => collab_folder::ViewLayout::Document,
-src/biz/collab/folder_view.rs:534:    ViewLayout::Grid => collab_folder::ViewLayout::Grid,
-src/biz/collab/folder_view.rs:535:    ViewLayout::Board => collab_folder::ViewLayout::Board,
-src/biz/collab/folder_view.rs:536:    ViewLayout::Calendar => collab_folder::ViewLayout::Calendar,
-src/biz/collab/folder_view.rs:537:    ViewLayout::Chat => collab_folder::ViewLayout::Chat,
+src/biz/collab/folder_view.rs:504:    CollabFolderViewLayout::Chart => ViewLayout::Chart,
+src/biz/collab/folder_view.rs:505:    CollabFolderViewLayout::List => ViewLayout::List,
+src/biz/collab/folder_view.rs:506:    CollabFolderViewLayout::Gallery => ViewLayout::Gallery,
+src/biz/collab/folder_view.rs:507:    CollabFolderViewLayout::Feed => ViewLayout::Feed,
+src/biz/collab/folder_view.rs:508:    CollabFolderViewLayout::Form => ViewLayout::Form,
+src/biz/collab/folder_view.rs:509:    CollabFolderViewLayout::Timeline => ViewLayout::Timeline,
+src/biz/collab/folder_view.rs:539:    ViewLayout::Document => collab_folder::ViewLayout::Document,
+src/biz/collab/folder_view.rs:540:    ViewLayout::Grid => collab_folder::ViewLayout::Grid,
+src/biz/collab/folder_view.rs:541:    ViewLayout::Board => collab_folder::ViewLayout::Board,
+src/biz/collab/folder_view.rs:542:    ViewLayout::Calendar => collab_folder::ViewLayout::Calendar,
+src/biz/collab/folder_view.rs:543:    ViewLayout::Chat => collab_folder::ViewLayout::Chat,
+src/biz/collab/folder_view.rs:544:    ViewLayout::Chart => collab_folder::ViewLayout::Chart,
+src/biz/collab/folder_view.rs:545:    ViewLayout::List => collab_folder::ViewLayout::List,
+src/biz/collab/folder_view.rs:546:    ViewLayout::Gallery => collab_folder::ViewLayout::Gallery,
+src/biz/collab/folder_view.rs:547:    ViewLayout::Feed => collab_folder::ViewLayout::Feed,
+src/biz/collab/folder_view.rs:548:    ViewLayout::Form => collab_folder::ViewLayout::Form,
+src/biz/collab/folder_view.rs:549:    ViewLayout::Timeline => collab_folder::ViewLayout::Timeline,
 src/biz/collab/utils.rs:509:        collab_folder::ViewLayout::Document,
 src/biz/workspace/publish_dup.rs:382:      ViewLayout::Document => {
 src/biz/workspace/publish_dup.rs:391:      ViewLayout::Grid | ViewLayout::Board | ViewLayout::Calendar => {
@@ -27,37 +39,63 @@ src/biz/workspace/page_view.rs:262:    ViewLayout::Grid => create_grid_page(stat
 src/biz/workspace/page_view.rs:263:    ViewLayout::Calendar => {
 src/biz/workspace/page_view.rs:266:    ViewLayout::Board => create_board_page(state, user, workspace_id, parent_view_id, name).await,
 src/biz/workspace/page_view.rs:267:    ViewLayout::Chat => create_chat_page(state, user, workspace_id, parent_view_id, name).await,
-src/biz/workspace/page_view.rs:416:    DatabaseLayout::Calendar,
-src/biz/workspace/page_view.rs:442:    DatabaseLayout::Grid,
-src/biz/workspace/page_view.rs:517:    DatabaseLayout::Board,
-src/biz/workspace/page_view.rs:1093:    collab_folder::ViewLayout::Document,
-src/biz/workspace/page_view.rs:1141:    collab_folder::ViewLayout::Grid,
-src/biz/workspace/page_view.rs:1167:    collab_folder::ViewLayout::Board,
-src/biz/workspace/page_view.rs:1193:    collab_folder::ViewLayout::Calendar,
-src/biz/workspace/page_view.rs:1346:    collab_folder::ViewLayout::Chat,
-src/biz/workspace/page_view.rs:1705:    collab_folder::ViewLayout::Document => {
-src/biz/workspace/page_view.rs:1708:    collab_folder::ViewLayout::Grid
-src/biz/workspace/page_view.rs:1709:    | collab_folder::ViewLayout::Board
-src/biz/workspace/page_view.rs:1710:    | collab_folder::ViewLayout::Calendar => {
-src/biz/workspace/page_view.rs:1721:    collab_folder::ViewLayout::Chat => Err(AppError::InvalidRequest(
-src/biz/workspace/page_view.rs:1921:      layout: ViewLayout::Document,
-src/biz/workspace/page_view.rs:1987:    collab_folder::ViewLayout::Document => {
-src/biz/workspace/page_view.rs:1990:    collab_folder::ViewLayout::Grid
-src/biz/workspace/page_view.rs:1991:    | collab_folder::ViewLayout::Board
-src/biz/workspace/page_view.rs:1992:    | collab_folder::ViewLayout::Calendar => {
-src/biz/workspace/page_view.rs:1995:    collab_folder::ViewLayout::Chat => Err(AppError::InvalidRequest(
-src/biz/workspace/page_view.rs:2164:    ViewLayout::Grid => DatabaseLayout::Grid,
-src/biz/workspace/page_view.rs:2165:    ViewLayout::Board => DatabaseLayout::Board,
-src/biz/workspace/page_view.rs:2166:    ViewLayout::Calendar => DatabaseLayout::Calendar,
+src/biz/workspace/page_view.rs:422:    DatabaseLayout::Calendar,
+src/biz/workspace/page_view.rs:448:    DatabaseLayout::Grid,
+src/biz/workspace/page_view.rs:523:    DatabaseLayout::Board,
+src/biz/workspace/page_view.rs:1099:    collab_folder::ViewLayout::Document,
+src/biz/workspace/page_view.rs:1147:    collab_folder::ViewLayout::Grid,
+src/biz/workspace/page_view.rs:1173:    collab_folder::ViewLayout::Board,
+src/biz/workspace/page_view.rs:1199:    collab_folder::ViewLayout::Calendar,
+src/biz/workspace/page_view.rs:1352:    collab_folder::ViewLayout::Chat,
+src/biz/workspace/page_view.rs:1711:    collab_folder::ViewLayout::Document => {
+src/biz/workspace/page_view.rs:1714:    collab_folder::ViewLayout::Grid
+src/biz/workspace/page_view.rs:1715:    | collab_folder::ViewLayout::Board
+src/biz/workspace/page_view.rs:1716:    | collab_folder::ViewLayout::Calendar
+src/biz/workspace/page_view.rs:1717:    | collab_folder::ViewLayout::Chart
+src/biz/workspace/page_view.rs:1718:    | collab_folder::ViewLayout::List
+src/biz/workspace/page_view.rs:1719:    | collab_folder::ViewLayout::Gallery
+src/biz/workspace/page_view.rs:1720:    | collab_folder::ViewLayout::Feed
+src/biz/workspace/page_view.rs:1721:    | collab_folder::ViewLayout::Form
+src/biz/workspace/page_view.rs:1722:    | collab_folder::ViewLayout::Timeline => {
+src/biz/workspace/page_view.rs:1733:    collab_folder::ViewLayout::Chat => Err(AppError::InvalidRequest(
+src/biz/workspace/page_view.rs:1933:      layout: ViewLayout::Document,
+src/biz/workspace/page_view.rs:1999:    collab_folder::ViewLayout::Document => {
+src/biz/workspace/page_view.rs:2002:    collab_folder::ViewLayout::Grid
+src/biz/workspace/page_view.rs:2003:    | collab_folder::ViewLayout::Board
+src/biz/workspace/page_view.rs:2004:    | collab_folder::ViewLayout::Calendar
+src/biz/workspace/page_view.rs:2005:    | collab_folder::ViewLayout::Chart
+src/biz/workspace/page_view.rs:2006:    | collab_folder::ViewLayout::List
+src/biz/workspace/page_view.rs:2007:    | collab_folder::ViewLayout::Gallery
+src/biz/workspace/page_view.rs:2008:    | collab_folder::ViewLayout::Feed
+src/biz/workspace/page_view.rs:2009:    | collab_folder::ViewLayout::Form
+src/biz/workspace/page_view.rs:2010:    | collab_folder::ViewLayout::Timeline => {
+src/biz/workspace/page_view.rs:2013:    collab_folder::ViewLayout::Chat => Err(AppError::InvalidRequest(
+src/biz/workspace/page_view.rs:2199:    ViewLayout::Grid => Some(DatabaseLayout::Grid),
+src/biz/workspace/page_view.rs:2200:    ViewLayout::Board => Some(DatabaseLayout::Board),
+src/biz/workspace/page_view.rs:2201:    ViewLayout::Calendar => Some(DatabaseLayout::Calendar),
+src/biz/workspace/page_view.rs:2202:    ViewLayout::Chart => Some(DatabaseLayout::Chart),
+src/biz/workspace/page_view.rs:2203:    ViewLayout::List => Some(DatabaseLayout::List),
+src/biz/workspace/page_view.rs:2204:    ViewLayout::Gallery => Some(DatabaseLayout::Gallery),
+src/biz/workspace/page_view.rs:2205:    ViewLayout::Feed => Some(DatabaseLayout::Feed),
+src/biz/workspace/page_view.rs:2206:    ViewLayout::Form => Some(DatabaseLayout::Form),
+src/biz/workspace/page_view.rs:2207:    ViewLayout::Timeline => Some(DatabaseLayout::Timeline),
+src/biz/workspace/page_view.rs:2208:    ViewLayout::Document | ViewLayout::Chat => None,
+src/api/carehub_forms.rs:675:  if db_body.views.get_database_view_layout(&txn, view_id) != DatabaseLayout::Form {
 libs/workspace-template/src/document/vault_template.rs:47:    ViewLayout::Document
 libs/workspace-template/src/document/getting_started.rs:179:    ViewLayout::Document
 libs/workspace-template/src/document/getting_started.rs:247:            .with_layout(ViewLayout::Board)
 libs/workspace-template/src/document/getting_started.rs:310:    ViewLayout::Document
 libs/workspace-template/src/hierarchy_builder.rs:41:/// The default layout of the view is [ViewLayout::Document]
 libs/workspace-template/src/hierarchy_builder.rs:61:      layout: ViewLayout::Document,
-libs/shared-entity/src/dto/workspace_dto.rs:413:      ViewLayout::Document => "Document",
-libs/shared-entity/src/dto/workspace_dto.rs:414:      ViewLayout::Grid => "Grid",
-libs/shared-entity/src/dto/workspace_dto.rs:415:      ViewLayout::Board => "Board",
-libs/shared-entity/src/dto/workspace_dto.rs:416:      ViewLayout::Calendar => "Calendar",
-libs/shared-entity/src/dto/workspace_dto.rs:417:      ViewLayout::Chat => "Chat",
+libs/shared-entity/src/dto/workspace_dto.rs:423:      ViewLayout::Document => "Document",
+libs/shared-entity/src/dto/workspace_dto.rs:424:      ViewLayout::Grid => "Grid",
+libs/shared-entity/src/dto/workspace_dto.rs:425:      ViewLayout::Board => "Board",
+libs/shared-entity/src/dto/workspace_dto.rs:426:      ViewLayout::Calendar => "Calendar",
+libs/shared-entity/src/dto/workspace_dto.rs:427:      ViewLayout::Chat => "Chat",
+libs/shared-entity/src/dto/workspace_dto.rs:428:      ViewLayout::Chart => "Chart",
+libs/shared-entity/src/dto/workspace_dto.rs:429:      ViewLayout::List => "List",
+libs/shared-entity/src/dto/workspace_dto.rs:430:      ViewLayout::Gallery => "Gallery",
+libs/shared-entity/src/dto/workspace_dto.rs:431:      ViewLayout::Feed => "Feed",
+libs/shared-entity/src/dto/workspace_dto.rs:432:      ViewLayout::Form => "Form",
+libs/shared-entity/src/dto/workspace_dto.rs:433:      ViewLayout::Timeline => "Timeline",
 services/appflowy-worker/src/import_worker/worker.rs:1045:      View::orphan_view(&orphan_view_id, ViewLayout::Document, Some(import_task.uid))

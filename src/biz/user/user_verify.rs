@@ -66,6 +66,9 @@ pub async fn verify_token(access_token: &str, state: &AppState) -> Result<bool, 
       .await
       .context("fail to commit transaction to initialize workspace")?;
     state.metrics.collab_metrics.observe_pg_tx(start.elapsed());
+
+    // CareHub: add the person to the workspaces the administrator chose for them.
+    crate::api::carehub_admin::apply_pending_workspace_joins(state, new_uid, &user.email).await;
   } else {
     trace!("user already exists:{},{}", user.id, user.email);
   }

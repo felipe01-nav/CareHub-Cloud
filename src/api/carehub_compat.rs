@@ -44,6 +44,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
   super::carehub_messages::configure(cfg);
   // CareHub: Claude (AI writer, AI chat, AI fields) – see carehub_ai.rs
   super::carehub_ai::configure(cfg);
+  // CareHub: the Claude assistant panel – see carehub_assistant.rs
+  super::carehub_assistant::configure(cfg);
   cfg
     .service(
       web::resource("/api/workspace/{workspace_id}/view/{view_id}")

@@ -9,6 +9,9 @@
 # Start:        docker compose up -d
 # Stop:         docker compose down    (your data is kept)
 # Wipe data:    docker compose down -v (deletes ALL CareHub data)
+#
+# Web address: set CAREHUB_URL / CAREHUB_WS_URL in .env (default http://localhost),
+# e.g. CAREHUB_URL=https://my-mac.tailnet-name.ts.net  CAREHUB_WS_URL=wss://my-mac.tailnet-name.ts.net
 
 name: carehub
 
@@ -70,13 +73,13 @@ services:
       - GOTRUE_API_HOST=0.0.0.0
       - GOTRUE_API_PORT=9999
       - PORT=9999
-      - API_EXTERNAL_URL=http://localhost/gotrue
+      - API_EXTERNAL_URL=${CAREHUB_URL:-http://localhost}/gotrue
       - GOTRUE_DB_DRIVER=postgres
       - GOTRUE_DB_DATABASE_URL=postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres?search_path=auth
       - DATABASE_URL=postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres?search_path=auth
       - GOTRUE_DB_NAMESPACE=auth
-      - GOTRUE_SITE_URL=http://localhost
-      - GOTRUE_URI_ALLOW_LIST=http://localhost/**
+      - GOTRUE_SITE_URL=${CAREHUB_URL:-http://localhost}
+      - GOTRUE_URI_ALLOW_LIST=${CAREHUB_URL:-http://localhost}/**,http://localhost/**
       - GOTRUE_DISABLE_SIGNUP=false
       - GOTRUE_JWT_SECRET=${GOTRUE_JWT_SECRET:?Run "sh setup.sh" first}
       - GOTRUE_JWT_EXP=604800
@@ -115,8 +118,8 @@ services:
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - APPFLOWY_ENVIRONMENT=production
-      - APPFLOWY_BASE_URL=http://localhost
-      - APPFLOWY_WEB_URL=http://localhost
+      - APPFLOWY_BASE_URL=${CAREHUB_URL:-http://localhost}
+      - APPFLOWY_WEB_URL=${CAREHUB_URL:-http://localhost}
       - APPFLOWY_DATABASE_URL=postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
       - APPFLOWY_DATABASE_MAX_CONNECTIONS=20
       - APPFLOWY_REDIS_URI=redis://redis:6379
@@ -130,7 +133,7 @@ services:
       - APPFLOWY_S3_SECRET_KEY=${MINIO_PASSWORD}
       - APPFLOWY_S3_BUCKET=appflowy
       - APPFLOWY_S3_REGION=us-east-1
-      - APPFLOWY_S3_PRESIGNED_URL_ENDPOINT=http://localhost/minio-api
+      - APPFLOWY_S3_PRESIGNED_URL_ENDPOINT=${CAREHUB_URL:-http://localhost}/minio-api
       # E-mail is not set up for local testing (placeholders only).
       - APPFLOWY_MAILER_SMTP_HOST=smtp.invalid
       - APPFLOWY_MAILER_SMTP_PORT=465
@@ -187,9 +190,42 @@ services:
     platform: linux/amd64
     restart: unless-stopped
     environment:
-      - APPFLOWY_BASE_URL=http://localhost
-      - APPFLOWY_GOTRUE_BASE_URL=http://localhost/gotrue
-      - APPFLOWY_WS_BASE_URL=ws://localhost/ws/v2
+      - APPFLOWY_BASE_URL=${CAREHUB_URL:-http://localhost}
+      - APPFLOWY_GOTRUE_BASE_URL=${CAREHUB_URL:-http://localhost}/gotrue
+      - APPFLOWY_WS_BASE_URL=${CAREHUB_WS_URL:-ws://localhost}/ws/v2
+
+  # Automatic backups: database + uploaded files, every day, kept for 14 days.
+  # They land in the "backups" folder next to this file (~/carehub/backups).
+  backup:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - BACKUP_KEEP_DAYS=${BACKUP_KEEP_DAYS:-14}
+      - BACKUP_EVERY_HOURS=${BACKUP_EVERY_HOURS:-24}
+    volumes:
+      - ./backups:/backups
+      - minio_data:/minio:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        echo "CareHub backup service started"
+        while true; do
+          stamp=$$(date +%Y-%m-%d_%H%M)
+          if pg_dump -h postgres -U postgres -d postgres -Fc -f /backups/carehub-db-$$stamp.dump.part; then
+            mv /backups/carehub-db-$$stamp.dump.part /backups/carehub-db-$$stamp.dump
+            tar -czf /backups/carehub-files-$$stamp.tar.gz -C /minio . && echo "Backup OK: $$stamp"
+          else
+            rm -f /backups/carehub-db-$$stamp.dump.part
+            echo "Backup FAILED: $$stamp"
+          fi
+          find /backups -name 'carehub-*' -mtime +$$BACKUP_KEEP_DAYS -delete
+          sleep $$(( BACKUP_EVERY_HOURS * 3600 ))
+        done
 
 volumes:
   postgres_data:

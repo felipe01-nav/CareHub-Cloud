@@ -625,6 +625,240 @@ struct FormQuestion {
   required: bool,
   long_answer: bool,
   options: Vec<FormOption>,
+  show_if: Option<ShowIf>,
+}
+
+/// CareHub conditional logic: "show this question only when ...".
+#[derive(Debug, Clone)]
+struct ShowCondition {
+  question_id: String,
+  op: String,
+  value: String,
+}
+
+#[derive(Debug, Clone)]
+struct ShowIf {
+  any: bool,
+  conditions: Vec<ShowCondition>,
+}
+
+/// Reads the rule the web form builder saved as a JSON string under
+/// `carehub_show_if`. Conditions point at database fields; they are turned
+/// into the public question ids here.
+fn parse_show_if(value: Option<&Value>, token: &Uuid) -> Option<ShowIf> {
+  let raw = value?.as_str()?;
+  let parsed: Value = serde_json::from_str(raw).ok()?;
+  let any = parsed.get("match").and_then(|m| m.as_str()) == Some("any");
+  let conditions: Vec<ShowCondition> = parsed
+    .get("conditions")?
+    .as_array()?
+    .iter()
+    .filter_map(|c| {
+      let field_id = c.get("field_id")?.as_str()?;
+      let op = c.get("op")?.as_str()?;
+      Some(ShowCondition {
+        question_id: Uuid::new_v5(token, field_id.as_bytes()).to_string(),
+        op: op.to_string(),
+        value: c
+          .get("value")
+          .and_then(|v| v.as_str())
+          .unwrap_or_default()
+          .trim()
+          .to_string(),
+      })
+    })
+    .collect();
+  if conditions.is_empty() {
+    None
+  } else {
+    Some(ShowIf { any, conditions })
+  }
+}
+
+fn op_allowed(kind: &QuestionKind, op: &str) -> bool {
+  let ops: &[&str] = match kind {
+    QuestionKind::Text | QuestionKind::Url => {
+      &["is", "is_not", "contains", "not_contains", "empty", "not_empty"]
+    },
+    QuestionKind::Number => &["is", "is_not", "gt", "lt", "empty", "not_empty"],
+    QuestionKind::Checkbox => &["checked", "unchecked"],
+    QuestionKind::SingleSelect => &["is", "is_not", "empty", "not_empty"],
+    QuestionKind::MultiSelect => &["contains", "not_contains", "empty", "not_empty"],
+    QuestionKind::Date => &["is", "gt", "lt", "empty", "not_empty"],
+  };
+  ops.contains(&op)
+}
+
+fn answer_text(answer: Option<&Value>) -> String {
+  answer
+    .and_then(|a| a.get("value"))
+    .and_then(|v| v.as_str())
+    .unwrap_or_default()
+    .trim()
+    .to_string()
+}
+
+fn answer_number(answer: Option<&Value>) -> Option<f64> {
+  match answer.and_then(|a| a.get("value")) {
+    Some(Value::Number(n)) => n.as_f64(),
+    Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
+    _ => None,
+  }
+}
+
+fn answer_option_ids(answer: Option<&Value>) -> Vec<String> {
+  let answer = match answer {
+    Some(answer) => answer,
+    None => return vec![],
+  };
+  if let Some(id) = answer.get("option_id").and_then(|v| v.as_str()) {
+    return if id.is_empty() { vec![] } else { vec![id.to_string()] };
+  }
+  answer
+    .get("option_ids")
+    .and_then(|v| v.as_array())
+    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+    .unwrap_or_default()
+}
+
+fn answer_day(answer: Option<&Value>) -> String {
+  let iso = answer
+    .and_then(|a| a.get("iso"))
+    .and_then(|v| v.as_str())
+    .unwrap_or_default()
+    .trim();
+  iso.chars().take(10).collect()
+}
+
+fn answer_checked(answer: Option<&Value>) -> bool {
+  answer
+    .and_then(|a| a.get("value"))
+    .and_then(|v| v.as_bool())
+    .unwrap_or(false)
+}
+
+fn answer_is_empty(kind: &QuestionKind, answer: Option<&Value>) -> bool {
+  match kind {
+    QuestionKind::Text | QuestionKind::Url => answer_text(answer).is_empty(),
+    QuestionKind::Number => answer_number(answer).is_none(),
+    QuestionKind::Checkbox => !answer_checked(answer),
+    QuestionKind::SingleSelect | QuestionKind::MultiSelect => answer_option_ids(answer).is_empty(),
+    QuestionKind::Date => answer_day(answer).is_empty(),
+  }
+}
+
+/// `None` = the condition is incomplete and is ignored (same as the web app).
+fn condition_result(source: &FormQuestion, op: &str, value: &str, answer: Option<&Value>) -> Option<bool> {
+  if !op_allowed(&source.kind, op) {
+    return None;
+  }
+  let needs_value = !matches!(op, "empty" | "not_empty" | "checked" | "unchecked");
+  if needs_value && value.is_empty() {
+    return None;
+  }
+  match op {
+    "empty" => return Some(answer_is_empty(&source.kind, answer)),
+    "not_empty" => return Some(!answer_is_empty(&source.kind, answer)),
+    "checked" => return Some(answer_checked(answer)),
+    "unchecked" => return Some(!answer_checked(answer)),
+    _ => {},
+  }
+  match source.kind {
+    QuestionKind::Number => {
+      let target = value.parse::<f64>().ok()?;
+      let number = answer_number(answer);
+      match (op, number) {
+        ("is_not", None) => Some(true),
+        (_, None) => Some(false),
+        ("is", Some(n)) => Some(n == target),
+        ("is_not", Some(n)) => Some(n != target),
+        ("gt", Some(n)) => Some(n > target),
+        ("lt", Some(n)) => Some(n < target),
+        _ => None,
+      }
+    },
+    QuestionKind::SingleSelect | QuestionKind::MultiSelect => {
+      let ids = answer_option_ids(answer);
+      let has = ids.iter().any(|id| id == value);
+      match op {
+        "is" | "contains" => Some(has),
+        "is_not" | "not_contains" => Some(!has),
+        _ => None,
+      }
+    },
+    QuestionKind::Date => {
+      let day = answer_day(answer);
+      let target: String = value.chars().take(10).collect();
+      if day.is_empty() {
+        return Some(false);
+      }
+      match op {
+        "is" => Some(day == target),
+        "gt" => Some(day > target),
+        "lt" => Some(day < target),
+        _ => None,
+      }
+    },
+    QuestionKind::Text | QuestionKind::Url => {
+      let text = answer_text(answer).to_lowercase();
+      let target = value.to_lowercase();
+      match op {
+        "is" => Some(text == target),
+        "is_not" => Some(text != target),
+        "contains" => Some(text.contains(&target)),
+        "not_contains" => Some(!text.contains(&target)),
+        _ => None,
+      }
+    },
+    QuestionKind::Checkbox => None,
+  }
+}
+
+/// Ids of the questions that are shown for these answers. Hidden questions
+/// count as unanswered, so a chain of rules hides everything below it.
+fn visible_question_ids(questions: &[FormQuestion], answers: &HashMap<String, Value>) -> HashSet<String> {
+  let by_id: HashMap<&str, &FormQuestion> = questions.iter().map(|q| (q.id.as_str(), q)).collect();
+  let mut visible: HashSet<String> = questions.iter().map(|q| q.id.clone()).collect();
+  for _ in 0..=questions.len() {
+    let mut next: HashSet<String> = HashSet::new();
+    for q in questions {
+      let results: Vec<bool> = match &q.show_if {
+        Some(rule) => rule
+          .conditions
+          .iter()
+          .filter_map(|c| {
+            let source = by_id.get(c.question_id.as_str())?;
+            if source.id == q.id {
+              return None;
+            }
+            let answer = if visible.contains(&source.id) {
+              answers.get(&source.id)
+            } else {
+              None
+            };
+            condition_result(source, &c.op, &c.value, answer)
+          })
+          .collect(),
+        None => vec![],
+      };
+      let any = q.show_if.as_ref().map(|r| r.any).unwrap_or(false);
+      let shown = results.is_empty()
+        || if any {
+          results.iter().any(|r| *r)
+        } else {
+          results.iter().all(|r| *r)
+        };
+      if shown {
+        next.insert(q.id.clone());
+      }
+    }
+    let same = next == visible;
+    visible = next;
+    if same {
+      break;
+    }
+  }
+  visible
 }
 
 struct FormSchema {
@@ -760,6 +994,7 @@ fn read_form_schema(
         required: json_bool(get("required"), false),
         kind,
         options,
+        show_if: parse_show_if(get("carehub_show_if"), token),
       },
     ));
   }
@@ -801,6 +1036,17 @@ fn question_json(q: &FormQuestion) -> Value {
       })
       .collect();
     value["options"] = json!(options);
+  }
+  if let Some(rule) = &q.show_if {
+    let conditions: Vec<Value> = rule
+      .conditions
+      .iter()
+      .map(|c| json!({ "question_id": c.question_id, "op": c.op, "value": c.value }))
+      .collect();
+    value["show_if"] = json!({
+      "match": if rule.any { "any" } else { "all" },
+      "conditions": conditions,
+    });
   }
   value
 }
@@ -1098,7 +1344,12 @@ async fn public_form_submit_handler(
   let answers = body.into_inner().answers;
   let mut cells: Vec<(String, Cell)> = Vec::new();
   let mut missing: Vec<String> = Vec::new();
+  // CareHub: questions hidden by their rule are skipped (not required, not saved).
+  let visible = visible_question_ids(&schema.questions, &answers);
   for q in &schema.questions {
+    if !visible.contains(&q.id) {
+      continue;
+    }
     let cell = match answers.get(&q.id) {
       Some(answer) => match answer_to_cell(q, answer) {
         Ok(cell) => cell,

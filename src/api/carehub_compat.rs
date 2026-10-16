@@ -47,6 +47,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/workspace/{workspace_id}/database-view-creation-status")
         .route(web::get().to(database_view_creation_status_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/collab/{object_id}/permission")
+        .route(web::get().to(collab_permission_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/spaces/{space_id}/permission")
+        .route(web::get().to(space_permission_handler)),
     );
 }
 
@@ -250,5 +258,120 @@ async fn database_view_creation_status_handler(
   Ok(Json(AppResponse::Ok().with_data(json!({
     "can_create_form": false,
     "can_create_chart": false,
+  }))))
+}
+
+// ---------------------------------------------------------------------------
+// Permission answers
+//
+// The web client asks the server what the signed-in user may do with a page
+// before it unlocks the editor. This server has no per-page permissions, so
+// the answer follows the user's workspace role, exactly like the rest of the
+// server: owners and members can edit, guests can only read, and anyone
+// outside the workspace is refused (403).
+// ---------------------------------------------------------------------------
+
+/// Access levels used by the web client.
+const ACCESS_READ_ONLY: i32 = 10;
+const ACCESS_READ_AND_WRITE: i32 = 30;
+const ACCESS_FULL: i32 = 50;
+
+#[derive(Debug, Deserialize)]
+struct CollabPermissionQuery {
+  collab_type: Option<i32>,
+}
+
+/// Returns the user's role in the workspace, or an error if they are not in it.
+async fn workspace_role(
+  state: &AppState,
+  user_uuid: &UserUuid,
+  workspace_id: &Uuid,
+) -> Result<AFRole, AppError> {
+  let uid = state.user_cache.get_user_uid(user_uuid).await?;
+  let access = &state.workspace_access_control;
+  if access
+    .enforce_role_weak(&uid, workspace_id, AFRole::Owner)
+    .await
+    .is_ok()
+  {
+    return Ok(AFRole::Owner);
+  }
+  if access
+    .enforce_role_weak(&uid, workspace_id, AFRole::Member)
+    .await
+    .is_ok()
+  {
+    return Ok(AFRole::Member);
+  }
+  access
+    .enforce_role_weak(&uid, workspace_id, AFRole::Guest)
+    .await?;
+  Ok(AFRole::Guest)
+}
+
+/// GET /api/workspace/{workspace_id}/collab/{object_id}/permission?collab_type=N
+async fn collab_permission_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  query: web::Query<CollabPermissionQuery>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, object_id) = path.into_inner();
+  let role = workspace_role(&state, &user_uuid, &workspace_id).await?;
+  let (access_level, can_write, can_share) = match role {
+    AFRole::Owner => (ACCESS_FULL, true, true),
+    AFRole::Member => (ACCESS_READ_AND_WRITE, true, true),
+    AFRole::Guest => (ACCESS_READ_ONLY, false, false),
+  };
+  Ok(Json(AppResponse::Ok().with_data(json!({
+    "object_id": object_id.to_string(),
+    "collab_type": query.collab_type.unwrap_or(0),
+    "governing_view_id": object_id.to_string(),
+    "access_level": access_level,
+    "can_read": true,
+    "can_write": can_write,
+    "can_comment": can_write,
+    "can_share": can_share,
+  }))))
+}
+
+/// GET /api/workspace/{workspace_id}/spaces/{space_id}/permission
+/// Spaces on this server are always open to every workspace member.
+async fn space_permission_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, space_id) = path.into_inner();
+  let role = workspace_role(&state, &user_uuid, &workspace_id).await?;
+  let is_owner = matches!(role, AFRole::Owner);
+  let is_editor = !matches!(role, AFRole::Guest);
+  let current_level = match role {
+    AFRole::Owner => ACCESS_FULL,
+    AFRole::Member => ACCESS_READ_AND_WRITE,
+    AFRole::Guest => ACCESS_READ_ONLY,
+  };
+  Ok(Json(AppResponse::Ok().with_data(json!({
+    "space_id": space_id.to_string(),
+    "permission": {
+      "visibility": "public",
+      "owner_access_level": ACCESS_FULL,
+      "member_default_access_level": ACCESS_READ_AND_WRITE,
+      "everyone_else_access_level": Value::Null,
+      "invite_policy": "members_and_owners",
+      "sidebar_edit_policy": "members_and_owners",
+      "invite_link_enabled": false,
+      "security": {
+        "disable_guests": false,
+        "disable_public_links": true,
+        "disable_export": false,
+      },
+    },
+    "current_user_access_level": current_level,
+    "can_manage_space": is_owner,
+    "can_manage_members": is_owner,
+    "can_invite_members": is_editor,
+    "can_edit_sidebar": is_editor,
+    "explicit_member_count": 0,
   }))))
 }

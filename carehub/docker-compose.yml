@@ -156,6 +156,9 @@ services:
       # Claude (Anthropic API key) for the AI features, and optionally the model.
       - CAREHUB_ANTHROPIC_API_KEY=${CAREHUB_ANTHROPIC_API_KEY:-}
       - CAREHUB_AI_MODEL=${CAREHUB_AI_MODEL:-}
+      # Google Calendar sign-in (OAuth client from console.cloud.google.com).
+      - CAREHUB_GOOGLE_CLIENT_ID=${CAREHUB_GOOGLE_CLIENT_ID:-}
+      - CAREHUB_GOOGLE_CLIENT_SECRET=${CAREHUB_GOOGLE_CLIENT_SECRET:-}
     healthcheck:
       test: "curl --fail http://127.0.0.1:8000/health || exit 1"
       interval: 5s

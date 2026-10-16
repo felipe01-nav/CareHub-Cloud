@@ -6,6 +6,7 @@ pub mod carehub_assistant;
 pub mod carehub_calendar;
 pub mod carehub_compat;
 pub mod carehub_forms;
+pub mod carehub_google;
 pub mod carehub_icloud;
 pub mod carehub_messages;
 pub mod chat;

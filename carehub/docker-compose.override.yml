@@ -1,0 +1,29 @@
+# CareHub automatic updates.
+# Docker reads this file together with docker-compose.yml automatically.
+# Every 5 minutes Watchtower checks GitHub Packages for new CareHub images
+# (server, worker, web only) and restarts just those containers.
+# Needs GHCR_TOKEN (a GitHub token with read:packages) in .env.
+# Turn off: docker compose stop watchtower
+
+services:
+  appflowy_cloud:
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+  appflowy_worker:
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+  appflowy_web:
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+
+  watchtower:
+    image: nickfedor/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - REPO_USER=felipe01-nav
+      - REPO_PASS=${GHCR_TOKEN:?Add GHCR_TOKEN to .env}

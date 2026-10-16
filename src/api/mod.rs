@@ -4,6 +4,7 @@ pub mod carehub_admin;
 pub mod carehub_calendar;
 pub mod carehub_compat;
 pub mod carehub_forms;
+pub mod carehub_icloud;
 pub mod chat;
 pub mod data_import;
 pub mod file_storage;

@@ -1,0 +1,14 @@
+src/api/user.rs	/api/user
+src/api/template.rs	/api/template-center
+src/api/access_request.rs	/api/access-request
+src/api/workspace.rs	/api/workspace | /api/realtime
+src/api/server_info.rs	/api/server
+src/api/ws.rs	/ws
+src/api/data_import.rs	/api/import
+src/api/metrics.rs	/metrics
+src/api/guest.rs	/api/sharing/workspace
+src/api/chat.rs	/api/chat/{workspace_id}
+src/api/search.rs	/api/search
+src/api/ai.rs	/api/ai/{workspace_id}
+src/api/invite_code.rs	/api/invite-code-info
+src/api/file_storage.rs	/api/file_storage

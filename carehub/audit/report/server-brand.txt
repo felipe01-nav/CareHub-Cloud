@@ -1,0 +1,220 @@
+libs/app-error/Cargo.toml:39	appflowy_ai_error = ["appflowy-ai-client", "async-openai"]
+libs/appflowy-ai-client/Cargo.toml:2	name = "appflowy-ai-client"
+libs/appflowy-ai-client/src/client.rs:30	info!("Creating AppFlowyAIClient with url: {}", url);
+libs/appflowy-proto/Cargo.toml:2	name = "appflowy-proto"
+libs/client-api-test/src/log.rs:50	filters.push(format!("appflowy_cloud={}", level));
+libs/client-api-test/src/user.rs:25	format!("user_{}@appflowy.io", Uuid::new_v4())
+libs/client-api/Cargo.toml:52	appflowy-proto = { path = "../appflowy-proto" }
+libs/client-api/src/http.rs:123	const DESKTOP_CALLBACK_URL: &str = "appflowy-flutter://login-callback";
+libs/client-api/src/http_billing.rs:13	static ref BASE_BILLING_URL: Option<String> = match std::env::var("APPFLOWY_CLOUD_BASE_BILLING_URL") {
+libs/client-api/src/http_billing.rs:16	tracing::warn!("std::env::var(APPFLOWY_CLOUD_BASE_BILLING_URL): {}", err);
+libs/collab-rt-entity/src/message.rs:22	std::env::var("APPFLOWY_REALTIME_MESSAGE_SIZE")
+libs/gotrue-entity/src/dto.rs:167	AuthProvider::Discord => "discord",
+libs/gotrue-entity/src/dto.rs:175	AuthProvider::Linkedin => "linkedin",
+libs/gotrue-entity/src/dto.rs:181	AuthProvider::Twitter => "twitter",
+libs/gotrue-entity/src/dto.rs:195	"discord" => Some(AuthProvider::Discord),
+libs/gotrue-entity/src/dto.rs:203	"linkedin" => Some(AuthProvider::Linkedin),
+libs/gotrue-entity/src/dto.rs:209	"twitter" => Some(AuthProvider::Twitter),
+libs/gotrue/src/params.rs:59	redirect_to: "appflowy-flutter://".to_string(),
+libs/indexer/README.md:163	"source": "appflowy",
+libs/indexer/src/collab_indexer/document_indexer.rs:157	"source": "appflowy",
+libs/indexer/src/collab_indexer/document_indexer.rs:58	get_env_var("APPFLOWY_EMBEDDING_CHUNK_SIZE", "2000")
+libs/indexer/src/collab_indexer/document_indexer.rs:61	get_env_var("APPFLOWY_EMBEDDING_CHUNK_OVERLAP", "200")
+libs/indexer/src/collab_indexer/provider.rs:46	let enabled = get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
+libs/indexer/src/queue.rs:13	const INDEXER_CONSUMER_NAME: &str = "appflowy_worker";
+libs/indexer/src/scheduler.rs:69	get_env_var("APPFLOWY_INDEXER_SCHEDULER_NUM_THREAD", "50")
+libs/llm-client/Cargo.toml:9	app-error = { workspace = true, features = ["appflowy_ai_error"] }
+libs/mailer/src/sender.rs:80	Some("AppFlowy Notification".to_string()),
+libs/workspace-template/assets/desktop_guide.json:17	"attributes": { "href": "https://appflowy.io/download" }
+libs/workspace-template/assets/desktop_guide.json:176	"href": "https://appflowy.gitbook.io/docs/essential-documentation/shortcuts"
+libs/workspace-template/assets/desktop_guide.json:190	"href": "https://appflowy.gitbook.io/docs/essential-documentation/markdown"
+libs/workspace-template/assets/desktop_guide.json:247	"url": "https://github.com/AppFlowy-IO/AppFlowy/blob/main/doc/readme/desktop_guide_1.jpg?raw=true"
+libs/workspace-template/assets/desktop_guide.json:251	"url": "https://github.com/AppFlowy-IO/AppFlowy/blob/main/doc/readme/desktop_guide_2.jpg?raw=true"
+libs/workspace-template/assets/desktop_guide.json:8	"delta": [{ "insert": "AppFlowy Desktop on macOS, Windows, and Linux" }]
+libs/workspace-template/assets/getting_started.json:122	"insert": "❤️Love AppFlowy and open source? Follow our latest product updates:"
+libs/workspace-template/assets/getting_started.json:133	"insert": "Twitter",
+libs/workspace-template/assets/getting_started.json:134	"attributes": { "href": "https://twitter.com/appflowy" }
+libs/workspace-template/assets/getting_started.json:136	{ "insert": ": @appflowy" }
+libs/workspace-template/assets/getting_started.json:146	"insert": "Reddit",
+libs/workspace-template/assets/getting_started.json:147	"attributes": { "href": "https://www.reddit.com/r/AppFlowy/" }
+libs/workspace-template/assets/getting_started.json:149	{ "insert": ": r/appflowy" }
+libs/workspace-template/assets/getting_started.json:161	"href": "https://github.com/AppFlowy-IO/AppFlowy"
+libs/workspace-template/assets/getting_started.json:36	"attributes": { "href": "https://appflowy.io/download" }
+libs/workspace-template/assets/getting_started.json:6	"data": { "level": 2, "delta": [{ "insert": "Welcome to AppFlowy" }] }
+libs/workspace-template/assets/inbox.json:157	"data": "Follow us on Twitter @appflowy"
+libs/workspace-template/assets/inbox.json:222	"data": "Install AppFlowy Mobile"
+libs/workspace-template/assets/inbox.json:235	"data": "Love AppFlowy and open source",
+libs/workspace-template/assets/inbox.json:271	"data": "Create an AppFlowy Cloud account"
+libs/workspace-template/assets/initial_document.json:10	"insert": "Welcome to AppFlowy!"
+libs/workspace-template/assets/initial_document.json:321	"href": "https://appflowy.gitbook.io/docs/essential-documentation/shortcuts"
+libs/workspace-template/assets/initial_document.json:337	"href": "https://appflowy.gitbook.io/docs/essential-documentation/markdown"
+libs/workspace-template/assets/initial_document.json:489	"insert": "\nLike AppFlowy? Follow us:\n"
+libs/workspace-template/assets/initial_document.json:493	"href": "https://github.com/AppFlowy-IO/AppFlowy"
+libs/workspace-template/assets/initial_document.json:502	"href": "https://twitter.com/appflowy"
+libs/workspace-template/assets/initial_document.json:504	"insert": "Twitter"
+libs/workspace-template/assets/initial_document.json:507	"insert": ": @appflowy\n"
+libs/workspace-template/assets/initial_document.json:511	"href": "https://blog-appflowy.ghost.io/"
+libs/workspace-template/assets/mobile_guide.json:101	"insert": "AppFlowy allows you to style your content in a beautiful and simple way"
+libs/workspace-template/assets/mobile_guide.json:110	"url": "https://github.com/AppFlowy-IO/AppFlowy/blob/main/doc/readme/mobile_guide_1.png?raw=true",
+libs/workspace-template/assets/mobile_guide.json:147	"url": "https://github.com/AppFlowy-IO/AppFlowy/blob/main/doc/readme/mobile_guide_2.png?raw=true"
+libs/workspace-template/assets/mobile_guide.json:151	"url": "https://github.com/AppFlowy-IO/AppFlowy/blob/main/doc/readme/mobile_guide_3.png?raw=true"
+libs/workspace-template/assets/mobile_guide.json:172	"url": "https://github.com/AppFlowy-IO/AppFlowy/blob/main/doc/readme/mobile_guide_4.png?raw=true",
+libs/workspace-template/assets/mobile_guide.json:197	"url": "https://github.com/AppFlowy-IO/AppFlowy/blob/main/doc/readme/mobile_guide_5.png?raw=true"
+libs/workspace-template/assets/to-dos.json:164	"data": "Follow us on Twitter @appflowy"
+libs/workspace-template/assets/to-dos.json:221	"data": "Install AppFlowy Mobile"
+libs/workspace-template/assets/to-dos.json:236	"data": "Love AppFlowy and open source",
+libs/workspace-template/assets/to-dos.json:265	"data": "Create an AppFlowy Cloud account"
+libs/workspace-template/assets/web_guide.json:10	"insert": "AppFlowy is right in "
+libs/workspace-template/assets/web_guide.json:15	"href": "https://appflowy.com/"
+libs/workspace-template/assets/web_guide.json:296	"url": "https://beta.appflowy.cloud/api/file_storage/c29fafc4-b7c0-4549-8702-71339b0fd9ea/v1/blob/735c7c28%2D33a0%2D4e9f%2D92e6%2D089630656063/P5aRDW-HGm6vk4gjZg8w6jgD_z2yE402OuI1uutNN3A=.png"
+libs/workspace-template/assets/web_guide.json:318	"url": "https://beta.appflowy.cloud/api/file_storage/c29fafc4-b7c0-4549-8702-71339b0fd9ea/v1/blob/735c7c28%2D33a0%2D4e9f%2D92e6%2D089630656063/TRYYtsRlWsmEYPSsIkpYs0uawhrtj3W52kg0VgwZ2J0=.png",
+libs/workspace-template/assets/web_guide.json:343	"url": "https://beta.appflowy.cloud/api/file_storage/c29fafc4-b7c0-4549-8702-71339b0fd9ea/v1/blob/735c7c28%2D33a0%2D4e9f%2D92e6%2D089630656063/JimDFWOY8_ATw20LkDuBg68TwkwtmSysbRbMd2eNjZ0=.png",
+libs/workspace-template/assets/web_guide.json:374	"href": "https://appflowy.gitbook.io/docs/essential-documentation/shortcuts"
+libs/workspace-template/assets/web_guide.json:390	"href": "https://appflowy.gitbook.io/docs/essential-documentation/markdown"
+libs/workspace-template/src/document/getting_started.rs:129	.with_extra(r#"{"font_layout":"normal","line_height_layout":"normal","cover":{"type":"gradient","value":"appflowy_them_color_gradient4"},"font":null}"#)
+libs/workspace-template/src/document/vault_template.rs:39	.with_extra(r#"{"font_layout":"normal","line_height_layout":"normal","cover":{"type":"gradient","value":"appflowy_them_color_gradient4"},"font":null}"#)
+services/appflowy-collaborate/Cargo.toml:2	name = "appflowy-collaborate"
+services/appflowy-collaborate/Cargo.toml:20	"appflowy_ai_error",
+services/appflowy-collaborate/src/actix_ws/server/rt_actor.rs:50	match std::env::var("APPFLOWY_WEBSOCKET_MAILBOX_SIZE") {
+services/appflowy-collaborate/src/collab/cache/collab_cache.rs:178	let batch_row_size = get_env_var("APPFLOWY_REDIS_BATCH_DB_ROW_COLLAB_SIZE", "50")
+services/appflowy-collaborate/src/collab/cache/collab_cache.rs:198	let size = get_env_var("APPFLOWY_REDIS_BATCH_COLLAB_SIZE", "10")
+services/appflowy-collaborate/src/collab/cache/collab_cache.rs:415	let size = get_env_var("APPFLOWY_REDIS_BATCH_DB_ROW_COLLAB_SIZE", "50")
+services/appflowy-collaborate/src/collab/cache/collab_cache.rs:426	let size = get_env_var("APPFLOWY_REDIS_BATCH_COLLAB_SIZE", "10")
+services/appflowy-collaborate/src/collab/cache/collab_cache.rs:70	let small_collab_size = get_env_var("APPFLOWY_SMALL_COLLAB_SIZE", "4096")
+services/appflowy-collaborate/src/collab/cache/mem_cache.rs:78	let small_collab_size = get_env_var("APPFLOWY_SMALL_COLLAB_SIZE", "4096")
+services/appflowy-collaborate/src/config.rs:158	app_env: get_env_var("APPFLOWY_ENVIRONMENT", "local")
+services/appflowy-collaborate/src/config.rs:160	.context("fail to get APPFLOWY_ENVIRONMENT")?,
+services/appflowy-collaborate/src/config.rs:162	port: get_env_var("APPFLOWY_COLLAB_SERVICE_PORT", "8001").parse()?,
+services/appflowy-collaborate/src/config.rs:163	host: get_env_var("APPFLOWY_COLLAB_SERVICE_HOST", "0.0.0.0"),
+services/appflowy-collaborate/src/config.rs:166	heartbeat_interval: get_env_var("APPFLOWY_WEBSOCKET_HEARTBEAT_INTERVAL", "6").parse()?,
+services/appflowy-collaborate/src/config.rs:167	client_timeout: get_env_var("APPFLOWY_WEBSOCKET_CLIENT_TIMEOUT", "60").parse()?,
+services/appflowy-collaborate/src/config.rs:168	min_client_version: get_env_var("APPFLOWY_WEBSOCKET_CLIENT_MIN_VERSION", "0.5.0").parse()?,
+services/appflowy-collaborate/src/config.rs:172	"APPFLOWY_DATABASE_URL",
+services/appflowy-collaborate/src/config.rs:175	require_ssl: get_env_var("APPFLOWY_DATABASE_REQUIRE_SSL", "false")
+services/appflowy-collaborate/src/config.rs:177	.context("fail to get APPFLOWY_DATABASE_REQUIRE_SSL")?,
+services/appflowy-collaborate/src/config.rs:178	max_connections: get_env_var("APPFLOWY_DATABASE_MAX_CONNECTIONS", "40")
+services/appflowy-collaborate/src/config.rs:180	.context("fail to get APPFLOWY_DATABASE_MAX_CONNECTIONS")?,
+services/appflowy-collaborate/src/config.rs:183	create_bucket: get_env_var("APPFLOWY_S3_CREATE_BUCKET", "true")
+services/appflowy-collaborate/src/config.rs:185	.context("fail to get APPFLOWY_S3_CREATE_BUCKET")?,
+services/appflowy-collaborate/src/config.rs:186	use_minio: get_env_var("APPFLOWY_S3_USE_MINIO", "true")
+services/appflowy-collaborate/src/config.rs:188	.context("fail to get APPFLOWY_S3_USE_MINIO")?,
+services/appflowy-collaborate/src/config.rs:189	minio_url: get_env_var("APPFLOWY_S3_MINIO_URL", "http://localhost:9000"),
+services/appflowy-collaborate/src/config.rs:190	access_key: get_env_var("APPFLOWY_S3_ACCESS_KEY", "minioadmin"),
+services/appflowy-collaborate/src/config.rs:191	secret_key: get_env_var("APPFLOWY_S3_SECRET_KEY", "minioadmin").into(),
+services/appflowy-collaborate/src/config.rs:192	bucket: get_env_var("APPFLOWY_S3_BUCKET", "appflowy"),
+services/appflowy-collaborate/src/config.rs:193	region: get_env_var("APPFLOWY_S3_REGION", ""),
+services/appflowy-collaborate/src/config.rs:197	jwt_secret: get_env_var("APPFLOWY_GOTRUE_JWT_SECRET", "hello456").into(),
+services/appflowy-collaborate/src/config.rs:201	"APPFLOWY_COLLAB_GROUP_PERSISTENCE_INTERVAL",
+services/appflowy-collaborate/src/config.rs:205	group_prune_grace_period_secs: get_env_var("APPFLOWY_COLLAB_GROUP_GRACE_PERIOD_SECS", "60")
+services/appflowy-collaborate/src/config.rs:207	edit_state_max_count: get_env_var("APPFLOWY_COLLAB_EDIT_STATE_MAX_COUNT", "100").parse()?,
+services/appflowy-collaborate/src/config.rs:208	edit_state_max_secs: get_env_var("APPFLOWY_COLLAB_EDIT_STATE_MAX_SECS", "60").parse()?,
+services/appflowy-collaborate/src/config.rs:209	s3_collab_threshold: get_env_var("APPFLOWY_COLLAB_S3_THRESHOLD", "8000").parse()?,
+services/appflowy-collaborate/src/config.rs:211	redis_uri: get_env_var("APPFLOWY_REDIS_URI", "redis://localhost:6379").into(),
+services/appflowy-collaborate/src/config.rs:212	redis_worker_count: get_env_var("APPFLOWY_REDIS_WORKERS", "60").parse()?,
+services/appflowy-collaborate/src/group/state.rs:28	let remove_batch_size = get_env_var("APPFLOWY_COLLABORATE_REMOVE_BATCH_SIZE", "50")
+services/appflowy-worker/Cargo.toml:2	name = "appflowy-worker"
+services/appflowy-worker/Cargo.toml:63	appflowy-collaborate = { path = "../appflowy-collaborate" }
+services/appflowy-worker/Cargo.toml:9	name = "appflowy_worker"
+services/appflowy-worker/src/application.rs:105	let tick_interval = get_env_var("APPFLOWY_WORKER_IMPORT_TICK_INTERVAL", "10")
+services/appflowy-worker/src/application.rs:111	get_env_var("APPFLOWY_WORKER_MAX_IMPORT_FILE_SIZE", "1_000_000_000")
+services/appflowy-worker/src/application.rs:128	enable: appflowy_collaborate::config::get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
+services/appflowy-worker/src/application.rs:204	"appflowy-worker",
+services/appflowy-worker/src/config.rs:21	app_env: get_env_var("APPFLOWY_WORKER_ENVIRONMENT", "local")
+services/appflowy-worker/src/config.rs:23	.context("fail to get APPFLOWY_WORKER_ENVIRONMENT")?,
+services/appflowy-worker/src/config.rs:24	redis_url: get_env_var("APPFLOWY_WORKER_REDIS_URL", "redis://localhost:6379"),
+services/appflowy-worker/src/config.rs:27	"APPFLOWY_WORKER_DATABASE_URL",
+services/appflowy-worker/src/config.rs:30	require_ssl: get_env_var("APPFLOWY_WORKER_DATABASE_REQUIRE_SSL", "false")
+services/appflowy-worker/src/config.rs:32	.context("fail to get APPFLOWY_WORKER_DATABASE_REQUIRE_SSL")?,
+services/appflowy-worker/src/config.rs:33	max_connections: get_env_var("APPFLOWY_WORKER_DATABASE_MAX_CONNECTIONS", "10")
+services/appflowy-worker/src/config.rs:35	.context("fail to get APPFLOWY_WORKER_DATABASE_MAX_CONNECTIONS")?,
+services/appflowy-worker/src/config.rs:36	database_name: get_env_var("APPFLOWY_WORKER_DATABASE_NAME", "postgres"),
+services/appflowy-worker/src/config.rs:39	use_minio: get_env_var("APPFLOWY_S3_USE_MINIO", "true")
+services/appflowy-worker/src/config.rs:41	.context("fail to get APPFLOWY_S3_USE_MINIO")?,
+services/appflowy-worker/src/config.rs:42	minio_url: get_env_var("APPFLOWY_S3_MINIO_URL", "http://localhost:9000"),
+services/appflowy-worker/src/config.rs:43	access_key: get_env_var("APPFLOWY_S3_ACCESS_KEY", "minioadmin"),
+services/appflowy-worker/src/config.rs:44	secret_key: get_env_var("APPFLOWY_S3_SECRET_KEY", "minioadmin").into(),
+services/appflowy-worker/src/config.rs:45	bucket: get_env_var("APPFLOWY_S3_BUCKET", "appflowy"),
+services/appflowy-worker/src/config.rs:46	region: get_env_var("APPFLOWY_S3_REGION", ""),
+services/appflowy-worker/src/config.rs:49	smtp_host: get_env_var("APPFLOWY_MAILER_SMTP_HOST", "smtp.gmail.com"),
+services/appflowy-worker/src/config.rs:50	smtp_port: get_env_var("APPFLOWY_MAILER_SMTP_PORT", "465").parse()?,
+services/appflowy-worker/src/config.rs:51	smtp_email: get_env_var("APPFLOWY_MAILER_SMTP_EMAIL", "sender@example.com"),
+services/appflowy-worker/src/config.rs:57	smtp_username: get_env_var("APPFLOWY_MAILER_SMTP_USERNAME", "sender@example.com"),
+services/appflowy-worker/src/config.rs:58	smtp_password: get_env_var("APPFLOWY_MAILER_SMTP_PASSWORD", "password").into(),
+services/appflowy-worker/src/config.rs:59	smtp_tls_kind: get_env_var("APPFLOWY_MAILER_SMTP_TLS_KIND", "wrapper"),
+services/appflowy-worker/src/import_worker/worker.rs:448	let hours = get_env_var("APPFLOWY_WORKER_IMPORT_TASK_PROCESS_EXPIRE_HOURS", "6")
+services/appflowy-worker/src/import_worker/worker.rs:466	let minutes = get_env_var("APPFLOWY_WORKER_IMPORT_TASK_EXPIRE_MINUTES", "30")
+services/appflowy-worker/src/import_worker/worker.rs:542	let retry_interval: u64 = get_env_var("APPFLOWY_WORKER_IMPORT_TASK_RETRY_INTERVAL", "10")
+services/appflowy-worker/src/import_worker/worker.rs:546	let streaming = get_env_var("APPFLOWY_WORKER_IMPORT_TASK_STREAMING", "false")
+services/appflowy-worker/src/import_worker/worker.rs:70	const CONSUMER_NAME: &str = "appflowy_worker";
+services/appflowy-worker/src/import_worker/worker.rs:718	"APPFLOWY_WORKER_IMPORT_TASK_MAX_FILE_SIZE_BYTES",
+services/appflowy-worker/src/metric.rs:23	let web_update_registry = registry.sub_registry_with_prefix("appflowy_web");
+src/api/data_import.rs:391	.unwrap_or("https://beta.appflowy.cloud")
+src/api/guest.rs:48	"this version of appflowy cloud server does not support guest editors",
+src/api/guest.rs:63	"this version of appflowy cloud server does not support guest editors",
+src/api/guest.rs:78	"this version of appflowy cloud server does not support guest editors",
+src/api/guest.rs:93	"this version of appflowy cloud server does not support guest editors",
+src/api/metrics.rs:253	let web_update_registry = registry.sub_registry_with_prefix("appflowy_web");
+src/api/metrics.rs:81	let af_registry = registry.sub_registry_with_prefix("appflowy_cloud");
+src/application.rs:247	info!("Setup AppFlowy AI: {}", config.appflowy_ai.url());
+src/application.rs:254	let use_redis_ac_cache = get_env_var("APPFLOWY_ACCESS_CONTROL_REDIS_CACHE_ENABLED", "false")
+src/application.rs:343	enable: get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
+src/application.rs:349	"APPFLOWY_INDEXER_EMBEDDING_BUFFER_SIZE",
+src/application.rs:579	"APPFLOWY_CORS_ALLOWED_ORIGIN",
+src/config/config.rs:182	app_env: get_env_var("APPFLOWY_ENVIRONMENT", "local")
+src/config/config.rs:184	.context("fail to get APPFLOWY_ENVIRONMENT")?,
+src/config/config.rs:186	is_enabled: get_env_var("APPFLOWY_ACCESS_CONTROL", "false")
+src/config/config.rs:188	.context("fail to get APPFLOWY_ACCESS_CONTROL")?,
+src/config/config.rs:189	enable_workspace_access_control: get_env_var("APPFLOWY_ACCESS_CONTROL_WORKSPACE", "true")
+src/config/config.rs:191	.context("fail to get APPFLOWY_ACCESS_CONTROL_WORKSPACE")?,
+src/config/config.rs:192	enable_collab_access_control: get_env_var("APPFLOWY_ACCESS_CONTROL_COLLAB", "true")
+src/config/config.rs:194	.context("fail to get APPFLOWY_ACCESS_CONTROL_COLLAB")?,
+src/config/config.rs:195	enable_realtime_access_control: get_env_var("APPFLOWY_ACCESS_CONTROL_REALTIME", "true")
+src/config/config.rs:197	.context("fail to get APPFLOWY_ACCESS_CONTROL_REALTIME")?,
+src/config/config.rs:201	"APPFLOWY_DATABASE_URL",
+src/config/config.rs:204	require_ssl: get_env_var("APPFLOWY_DATABASE_REQUIRE_SSL", "false")
+src/config/config.rs:206	.context("fail to get APPFLOWY_DATABASE_REQUIRE_SSL")?,
+src/config/config.rs:207	max_connections: get_env_var("APPFLOWY_DATABASE_MAX_CONNECTIONS", "40")
+src/config/config.rs:209	.context("fail to get APPFLOWY_DATABASE_MAX_CONNECTIONS")?,
+src/config/config.rs:212	base_url: get_env_var("APPFLOWY_GOTRUE_BASE_URL", "http://localhost:9999"),
+src/config/config.rs:213	jwt_secret: get_env_var("APPFLOWY_GOTRUE_JWT_SECRET", "hello456").into(),
+src/config/config.rs:214	service_role: get_env_var("APPFLOWY_GOTRUE_SERVICE_ROLE", "service_role"),
+src/config/config.rs:217	port: get_env_var("APPFLOWY_APPLICATION_PORT", "8000").parse()?,
+src/config/config.rs:218	host: get_env_var("APPFLOWY_APPLICATION_HOST", "[::]"),
+src/config/config.rs:221	heartbeat_interval: get_env_var("APPFLOWY_WEBSOCKET_HEARTBEAT_INTERVAL", "6").parse()?,
+src/config/config.rs:222	client_timeout: get_env_var("APPFLOWY_WEBSOCKET_CLIENT_TIMEOUT", "60").parse()?,
+src/config/config.rs:223	min_client_version: get_env_var("APPFLOWY_WEBSOCKET_CLIENT_MIN_VERSION", "0.5.0").parse()?,
+src/config/config.rs:225	redis_uri: get_env_var("APPFLOWY_REDIS_URI", "redis://localhost:6379").into(),
+src/config/config.rs:226	redis_worker_count: get_env_var("APPFLOWY_REDIS_WORKERS", "60").parse()?,
+src/config/config.rs:228	create_bucket: get_env_var("APPFLOWY_S3_CREATE_BUCKET", "true")
+src/config/config.rs:230	.context("fail to get APPFLOWY_S3_CREATE_BUCKET")?,
+src/config/config.rs:231	use_minio: get_env_var("APPFLOWY_S3_USE_MINIO", "true")
+src/config/config.rs:233	.context("fail to get APPFLOWY_S3_USE_MINIO")?,
+src/config/config.rs:234	minio_url: get_env_var("APPFLOWY_S3_MINIO_URL", "http://localhost:9000"),
+src/config/config.rs:235	access_key: get_env_var("APPFLOWY_S3_ACCESS_KEY", "minioadmin"),
+src/config/config.rs:236	secret_key: get_env_var("APPFLOWY_S3_SECRET_KEY", "minioadmin").into(),
+src/config/config.rs:237	bucket: get_env_var("APPFLOWY_S3_BUCKET", "appflowy"),
+src/config/config.rs:238	region: get_env_var("APPFLOWY_S3_REGION", ""),
+src/config/config.rs:239	presigned_url_endpoint: get_env_var_opt("APPFLOWY_S3_PRESIGNED_URL_ENDPOINT"),
+src/config/config.rs:247	"APPFLOWY_COLLAB_GROUP_PERSISTENCE_INTERVAL",
+src/config/config.rs:251	group_prune_grace_period_secs: get_env_var("APPFLOWY_COLLAB_GROUP_GRACE_PERIOD_SECS", "60")
+src/config/config.rs:253	edit_state_max_count: get_env_var("APPFLOWY_COLLAB_EDIT_STATE_MAX_COUNT", "100").parse()?,
+src/config/config.rs:254	edit_state_max_secs: get_env_var("APPFLOWY_COLLAB_EDIT_STATE_MAX_SECS", "60").parse()?,
+src/config/config.rs:255	s3_collab_threshold: get_env_var("APPFLOWY_COLLAB_S3_THRESHOLD", "8000").parse()?,
+src/config/config.rs:258	storage_backend: get_env_var("APPFLOWY_PUBLISHED_COLLAB_STORAGE_BACKEND", "postgres")
+src/config/config.rs:263	smtp_host: get_env_var("APPFLOWY_MAILER_SMTP_HOST", "smtp.gmail.com"),
+src/config/config.rs:264	smtp_port: get_env_var("APPFLOWY_MAILER_SMTP_PORT", "465").parse()?,
+src/config/config.rs:265	smtp_username: get_env_var("APPFLOWY_MAILER_SMTP_USERNAME", "sender@example.com"),
+src/config/config.rs:266	smtp_email: get_env_var("APPFLOWY_MAILER_SMTP_EMAIL", "sender@example.com"),
+src/config/config.rs:267	smtp_password: get_env_var("APPFLOWY_MAILER_SMTP_PASSWORD", "password").into(),
+src/config/config.rs:268	smtp_tls_kind: get_env_var("APPFLOWY_MAILER_SMTP_TLS_KIND", "wrapper"),
+src/config/config.rs:271	client_id: get_env_var("APPFLOWY_APPLE_OAUTH_CLIENT_ID", ""),
+src/config/config.rs:272	client_secret: get_env_var("APPFLOWY_APPLE_OAUTH_CLIENT_SECRET", "").into(),
+src/config/config.rs:274	appflowy_web_url: get_env_var_opt("APPFLOWY_WEB_URL")
+src/config/config.rs:275	.ok_or(anyhow!("APPFLOWY_WEB_URL has not been set"))?,
+src/config/config.rs:277	enable_email_notification: get_env_var("APPFLOWY_NOTIFICATION_ENABLE_EMAIL", "false")
+src/config/config.rs:280	"APPFLOWY_NOTIFICATION_EMAIL_INTERVAL_SECS",
+src/config/config.rs:285	"APPFLOWY_NOTIFICATION_EMAIL_GRACE_PERIOD_SECS",
+src/mailer.rs:24	"{} invited you to {} in AppFlowy",
+src/mailer.rs:55	"{} requested access to {} in AppFlowy",
+src/mailer.rs:96	"{} has mentioned you in {} in AppFlowy",
+src/main.rs:8	println!("AppFlowy Cloud with RUST_LOG={}", level);

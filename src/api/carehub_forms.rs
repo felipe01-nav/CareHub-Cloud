@@ -35,7 +35,7 @@ use collab_database::template::entity::CELL_DATA;
 use collab_database::views::{DatabaseLayout, OrderObjectPosition};
 use collab_entity::CollabType;
 use collab_folder::CollabOrigin;
-use database::collab::{CollabStore, GetCollabOrigin};
+use database::collab::GetCollabOrigin;
 use database_entity::dto::{AFRole, CollabParams};
 use serde::Deserialize;
 use serde_json::{json, Map as JsonMap, Value};
@@ -1217,7 +1217,8 @@ async fn public_form_submit_handler(
       &CollabOrigin::Server,
       db_update,
     )
-    .await?;
+    .await
+    .map_err(AppError::from)?;
 
   Ok(HttpResponse::Ok().json(json!({
     "submission_id": row_uuid.to_string(),

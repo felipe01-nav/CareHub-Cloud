@@ -22,6 +22,9 @@ ENV CARGO_BUILD_JOBS=2 \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 COPY --from=planner /app/recipe.json recipe.json
+# CareHub: the patched collaboration library (prepared by the build workflow,
+# see carehub/collab/apply.py) must be present before dependencies are built.
+COPY vendor vendor
 RUN cargo chef cook --profile ${CARGO_PROFILE} --recipe-path recipe.json
 COPY . .
 ENV SQLX_OFFLINE=true

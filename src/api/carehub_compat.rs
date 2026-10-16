@@ -33,6 +33,8 @@ const DEFAULT_DATABASE_PAGE_SIZE: usize = 200;
 /// Registers the compatibility routes. Must be registered before
 /// `workspace_scope()` so these exact paths are matched first.
 pub fn configure(cfg: &mut web::ServiceConfig) {
+  // CareHub forms (and adding any database view type) – see carehub_forms.rs
+  super::carehub_forms::configure(cfg);
   cfg
     .service(
       web::resource("/api/workspace/{workspace_id}/view/{view_id}")
@@ -312,13 +314,13 @@ async fn list_database_handler(
 }
 
 /// GET /api/workspace/{workspace_id}/database-view-creation-status
-/// Form and chart views need server features this server does not have.
+/// Forms are provided by carehub_forms.rs; charts are not available yet.
 async fn database_view_creation_status_handler(
   _user_uuid: UserUuid,
   _workspace_id: web::Path<Uuid>,
 ) -> ActixResult<Json<AppResponse<Value>>> {
   Ok(Json(AppResponse::Ok().with_data(json!({
-    "can_create_form": false,
+    "can_create_form": true,
     "can_create_chart": false,
   }))))
 }

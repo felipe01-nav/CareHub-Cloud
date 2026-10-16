@@ -72,4 +72,37 @@ Open <http://localhost> and sign in with **email + password**.
 
 - No e-mail: invite people with an **invite link** (Settings → Members), not by e-mail.
 - AI, search, forms, charts and version history are switched off for now.
-- Your data lives in Docker volumes on your Mac; `docker compose down -v` deletes it.
+- Your data lives in Docker volumes on your Mac; `docker compose down -v` deletes it
+  (the daily backups in `~/carehub/backups` are kept).
+
+## Backups (automatic)
+
+The `backup` service saves the database **and** uploaded files once a day into
+`~/carehub/backups` and keeps the last 14 days. Check it is working:
+
+```sh
+cd ~/carehub && ls -lh backups && docker compose logs --tail 5 backup
+```
+
+Copy that folder to an external drive or iCloud now and then – a backup on the
+same Mac doesn't help if the Mac dies.
+
+**Restore a backup** (replaces the current data – ask first if unsure):
+
+```sh
+cd ~/carehub
+docker compose stop appflowy_cloud appflowy_worker
+docker compose exec -T postgres pg_restore -U postgres -d postgres --clean --if-exists < backups/carehub-db-YYYY-MM-DD_HHMM.dump
+docker compose start appflowy_cloud appflowy_worker
+```
+
+## Opening CareHub from your phone (Tailscale)
+
+1. Install Tailscale on the Mac and the phone, signed in to the same account.
+2. In `~/carehub/.env` add (with your Mac's Tailscale name):
+   ```
+   CAREHUB_URL=https://your-mac.your-tailnet.ts.net
+   CAREHUB_WS_URL=wss://your-mac.your-tailnet.ts.net
+   ```
+3. `tailscale serve --bg 80` then `docker compose up -d`.
+4. Open the `https://…ts.net` address on the Mac and on the phone.

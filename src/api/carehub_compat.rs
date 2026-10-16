@@ -35,6 +35,8 @@ const DEFAULT_DATABASE_PAGE_SIZE: usize = 200;
 pub fn configure(cfg: &mut web::ServiceConfig) {
   // CareHub forms (and adding any database view type) – see carehub_forms.rs
   super::carehub_forms::configure(cfg);
+  // CareHub: Settings > User accounts (administrator only) – see carehub_admin.rs
+  super::carehub_admin::configure(cfg);
   cfg
     .service(
       web::resource("/api/workspace/{workspace_id}/view/{view_id}")

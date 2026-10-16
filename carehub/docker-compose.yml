@@ -148,6 +148,8 @@ services:
       - AI_OPENAI_API_KEY=
       - APPFLOWY_INDEXER_ENABLED=false
       - APPFLOWY_SEARCH_SERVICE_URL=http://localhost:4002
+      # Who may manage sign-in accounts (Settings > User accounts). Comma separated.
+      - CAREHUB_ADMIN_EMAILS=${CAREHUB_ADMIN_EMAILS:-}
     healthcheck:
       test: "curl --fail http://127.0.0.1:8000/health || exit 1"
       interval: 5s

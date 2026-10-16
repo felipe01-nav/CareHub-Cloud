@@ -1,0 +1,32 @@
+# CareHub: one-off audit. Lists every HTTP route of the server and
+# every visible "AppFlowy"/social-media text, then saves the report to the
+# carehub-audit branch (nothing is built or deployed).
+name: CareHub - audit
+on:
+  push:
+    branches: [carehub-audit]
+    paths: ["carehub/audit/server_audit.py", ".github/workflows/carehub-audit.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: self
+      - uses: actions/checkout@v4
+        with:
+          path: app
+          ref: main
+      - name: Run audit
+        run: python3 self/carehub/audit/server_audit.py app self/carehub/audit/report
+      - name: Save report
+        working-directory: self
+        run: |
+          git config user.name "carehub-audit"
+          git config user.email "carehub-audit@users.noreply.github.com"
+          git add carehub/audit/report
+          git commit -m "CareHub audit report [skip ci]" || echo "no changes"
+          git push

@@ -128,6 +128,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
       web::resource("/api/workspace/{workspace_id}/page-view/{view_id}/upgrade-database-container")
         .route(web::get().to(upgrade_database_container_status_handler)),
     )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/usage-and-limit")
+        .route(web::get().to(usage_and_limit_handler)),
+    )
     .service(web::resource("/api/server-info").route(web::get().to(server_info_handler)))
     .service(
       web::resource("/api/integrations/connections")
@@ -830,4 +834,43 @@ async fn integration_connections_handler(
   _user_uuid: UserUuid,
 ) -> ActixResult<Json<AppResponse<Value>>> {
   Ok(Json(AppResponse::Ok().with_data(json!({ "connections": [] }))))
+}
+
+/// GET /api/workspace/{workspace_id}/usage-and-limit
+/// CareHub is self-hosted without plans, so there are no limits. Members and
+/// stored file size are reported for information only.
+async fn usage_and_limit_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let workspace_id = workspace_id.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  let member_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM af_workspace_member WHERE workspace_id = $1")
+      .bind(workspace_id)
+      .fetch_one(&state.pg_pool)
+      .await
+      .unwrap_or(0);
+  let storage: Option<i64> = sqlx::query_scalar(
+    "SELECT COALESCE(SUM(file_size), 0)::BIGINT FROM af_blob_metadata WHERE workspace_id = $1",
+  )
+  .bind(workspace_id)
+  .fetch_one(&state.pg_pool)
+  .await
+  .ok();
+  Ok(Json(AppResponse::Ok().with_data(json!({
+    "member_count": member_count,
+    "member_count_limit": 1_000_000,
+    "storage_bytes": storage.unwrap_or(0),
+    "storage_bytes_limit": 0,
+    "storage_bytes_unlimited": true,
+    "storage_usage_available": storage.is_some(),
+    "single_upload_limit": 0,
+    "single_upload_unlimited": true,
+    "ai_responses_count": 0,
+    "ai_responses_count_limit": 0,
+    "local_ai": false,
+    "ai_responses_unlimited": false,
+  }))))
 }

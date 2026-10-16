@@ -1,0 +1,78 @@
+# CareHub: test-compiles the server on the carehub-forms branch and saves the
+# result to carehub/collab/report/ (nothing is built into images or deployed).
+name: CareHub - forms check
+on:
+  push:
+    branches: [carehub-forms]
+    paths:
+      - "carehub/collab/apply.py"
+      - ".github/workflows/carehub-forms-check.yml"
+      - "src/**"
+      - "libs/**"
+      - "services/**"
+      - "Cargo.toml"
+  workflow_dispatch:
+concurrency:
+  group: carehub-forms-check
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+      - uses: actions/checkout@v4
+      - name: Get the collaboration library and add the newer view types
+        run: |
+          git clone --quiet https://github.com/AppFlowy-IO/AppFlowy-Collab vendor/appflowy-collab
+          git -C vendor/appflowy-collab checkout --quiet e59260e524f33104b0ddcd6bb8f6218cad0f7e18
+          rm -rf vendor/appflowy-collab/.git vendor/appflowy-collab/rust-toolchain.toml
+          python3 carehub/collab/apply.py
+      - name: List layout uses
+        run: |
+          mkdir -p /tmp/rep
+          grep -rn --include=*.rs -E "ViewLayout::|DatabaseLayout::" src libs services > /tmp/rep/layout-uses.txt || true
+      - name: Install tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-chef
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            services/appflowy-worker -> target
+      - name: Test-compile
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set +e
+          cargo chef prepare --recipe-path /tmp/recipe.json > /tmp/rep/chef.txt 2>&1
+          echo "chef exit $?" > /tmp/rep/check.txt
+          cargo check --bin appflowy_cloud --message-format short > /tmp/server.txt 2>&1
+          echo "server exit $?" >> /tmp/rep/check.txt
+          (cd services/appflowy-worker && cargo check --bin appflowy_worker --message-format short) > /tmp/worker.txt 2>&1
+          echo "worker exit $?" >> /tmp/rep/check.txt
+          echo "== server errors ==" >> /tmp/rep/check.txt
+          grep -E "error" /tmp/server.txt | grep -v "^warning" | head -300 >> /tmp/rep/check.txt
+          echo "== server tail ==" >> /tmp/rep/check.txt
+          tail -40 /tmp/server.txt >> /tmp/rep/check.txt
+          echo "== worker errors ==" >> /tmp/rep/check.txt
+          grep -E "error" /tmp/worker.txt | grep -v "^warning" | head -150 >> /tmp/rep/check.txt
+          echo "== worker tail ==" >> /tmp/rep/check.txt
+          tail -25 /tmp/worker.txt >> /tmp/rep/check.txt
+          echo "commit $GITHUB_SHA" >> /tmp/rep/check.txt
+          exit 0
+      - name: Save report
+        run: |
+          git checkout -- . && rm -rf vendor
+          git config user.name "carehub-check"
+          git config user.email "carehub-check@users.noreply.github.com"
+          git pull --quiet --ff-only || true
+          mkdir -p carehub/collab/report && cp /tmp/rep/* carehub/collab/report/
+          git add carehub/collab/report
+          git commit -m "CareHub check report [skip ci]" || echo "no changes"
+          git push

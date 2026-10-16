@@ -501,6 +501,12 @@ pub fn to_dto_view_layout(collab_folder_view_layout: &CollabFolderViewLayout) ->
     CollabFolderViewLayout::Board => ViewLayout::Board,
     CollabFolderViewLayout::Calendar => ViewLayout::Calendar,
     CollabFolderViewLayout::Chat => ViewLayout::Chat,
+    CollabFolderViewLayout::Chart => ViewLayout::Chart,
+    CollabFolderViewLayout::List => ViewLayout::List,
+    CollabFolderViewLayout::Gallery => ViewLayout::Gallery,
+    CollabFolderViewLayout::Feed => ViewLayout::Feed,
+    CollabFolderViewLayout::Form => ViewLayout::Form,
+    CollabFolderViewLayout::Timeline => ViewLayout::Timeline,
   }
 }
 
@@ -535,6 +541,12 @@ pub fn to_folder_view_layout(layout: workspace_dto::ViewLayout) -> collab_folder
     ViewLayout::Board => collab_folder::ViewLayout::Board,
     ViewLayout::Calendar => collab_folder::ViewLayout::Calendar,
     ViewLayout::Chat => collab_folder::ViewLayout::Chat,
+    ViewLayout::Chart => collab_folder::ViewLayout::Chart,
+    ViewLayout::List => collab_folder::ViewLayout::List,
+    ViewLayout::Gallery => collab_folder::ViewLayout::Gallery,
+    ViewLayout::Feed => collab_folder::ViewLayout::Feed,
+    ViewLayout::Form => collab_folder::ViewLayout::Form,
+    ViewLayout::Timeline => collab_folder::ViewLayout::Timeline,
   }
 }
 

@@ -33,6 +33,13 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
+      - name: Get the collaboration library and add the newer view types (Form, List, ...)
+        run: |
+          git clone --quiet https://github.com/AppFlowy-IO/AppFlowy-Collab vendor/appflowy-collab
+          git -C vendor/appflowy-collab checkout --quiet e59260e524f33104b0ddcd6bb8f6218cad0f7e18
+          rm -rf vendor/appflowy-collab/.git vendor/appflowy-collab/rust-toolchain.toml
+          python3 carehub/collab/apply.py
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

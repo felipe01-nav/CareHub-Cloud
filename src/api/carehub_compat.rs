@@ -119,6 +119,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/workspace/{workspace_id}/page-view/{view_id}/upgrade-database-container")
         .route(web::get().to(upgrade_database_container_status_handler)),
+    )
+    .service(web::resource("/api/server-info").route(web::get().to(server_info_handler)))
+    .service(
+      web::resource("/api/integrations/connections")
+        .route(web::get().to(integration_connections_handler)),
     );
 }
 
@@ -290,7 +295,7 @@ async fn list_database_handler(
     .skip(offset)
     .take(limit)
     .map(|database| {
-      let views: Vec<Value> = database
+      let mut views: Vec<Value> = database
         .views
         .into_iter()
         .map(|view| {
@@ -300,10 +305,19 @@ async fn list_database_handler(
             "icon": view.icon,
             "layout": view.layout,
             "is_container": false,
+            "embedded": false,
             "parent_view_id": Value::Null,
           })
         })
         .collect();
+      // Databases on this server have no separate "container" page. The web
+      // client only offers databases with a container in the relation picker,
+      // so the first view also stands in as the container.
+      if let Some(first) = views.first().cloned() {
+        let mut container = first;
+        container["is_container"] = json!(true);
+        views.insert(0, container);
+      }
       json!({ "database_id": database.id, "views": views })
     })
     .collect();
@@ -405,10 +419,28 @@ async fn space_permission_handler(
   user_uuid: UserUuid,
   path: web::Path<(Uuid, Uuid)>,
   state: Data<AppState>,
+  req: HttpRequest,
 ) -> ActixResult<Json<AppResponse<Value>>> {
   let (workspace_id, space_id) = path.into_inner();
   let role = workspace_role(&state, &user_uuid, &workspace_id).await?;
-  let is_owner = matches!(role, AFRole::Owner);
+  // The person who created a space may also manage it (rename, icon).
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let space = load_view(&state, &req, &user_uuid, workspace_id, space_id, 0)
+    .await
+    .ok();
+  let is_creator = space
+    .as_ref()
+    .and_then(|v| v.created_by)
+    .map(|created_by| created_by == uid)
+    .unwrap_or(false);
+  let is_private = space
+    .as_ref()
+    .and_then(|v| v.extra.as_ref())
+    .and_then(|e| e.get("space_permission"))
+    .and_then(|v| v.as_i64())
+    == Some(1);
+  let visibility = if is_private { "private" } else { "public" };
+  let is_owner = matches!(role, AFRole::Owner) || (is_creator && !matches!(role, AFRole::Guest));
   let is_editor = !matches!(role, AFRole::Guest);
   let current_level = match role {
     AFRole::Owner => ACCESS_FULL,
@@ -418,7 +450,7 @@ async fn space_permission_handler(
   Ok(Json(AppResponse::Ok().with_data(json!({
     "space_id": space_id.to_string(),
     "permission": {
-      "visibility": "public",
+      "visibility": visibility,
       "owner_access_level": ACCESS_FULL,
       "member_default_access_level": ACCESS_READ_AND_WRITE,
       "everyone_else_access_level": Value::Null,
@@ -696,4 +728,36 @@ async fn upgrade_database_container_status_handler(
     "eligible": false,
     "already_upgraded": false,
   }))))
+}
+
+// ---------------------------------------------------------------------------
+// Batch 3: server information and connections
+// ---------------------------------------------------------------------------
+
+/// GET /api/server-info (no sign-in needed)
+/// Tells the web app which optional features this server offers. Connections
+/// to outside services (Google Drive and similar) are not offered.
+async fn server_info_handler(req: HttpRequest) -> ActixResult<Json<AppResponse<Value>>> {
+  let platform = req
+    .headers()
+    .get("x-platform")
+    .and_then(|v| v.to_str().ok())
+    .unwrap_or_default();
+  if platform == "app" {
+    return Ok(Json(AppResponse::Ok().with_data(json!({ "connections": [] }))));
+  }
+  Ok(Json(AppResponse::Ok().with_data(json!({
+    "enable_page_history": false,
+    "enable_database_history": false,
+    "ai_enabled": false,
+    "self_hosted": true,
+  }))))
+}
+
+/// GET /api/integrations/connections?workspace_id=...
+/// No outside services are connected on this server.
+async fn integration_connections_handler(
+  _user_uuid: UserUuid,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  Ok(Json(AppResponse::Ok().with_data(json!({ "connections": [] }))))
 }

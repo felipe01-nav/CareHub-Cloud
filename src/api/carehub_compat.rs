@@ -11,6 +11,8 @@
 use crate::api::util::realtime_user_for_web_request;
 use crate::biz;
 use crate::biz::authentication::jwt::UserUuid;
+use crate::biz::workspace::ops::get_workspace_mentionable_person;
+use crate::biz::workspace::page_view::update_space;
 use crate::state::AppState;
 use actix_web::web::{self, Data, Json};
 use actix_web::HttpRequest;
@@ -19,7 +21,8 @@ use app_error::AppError;
 use database_entity::dto::AFRole;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use shared_entity::dto::workspace_dto::FolderView;
+use database::collab::select_collab_id_exists;
+use shared_entity::dto::workspace_dto::{FolderView, SpacePermission};
 use shared_entity::response::AppResponse;
 use uuid::Uuid;
 
@@ -55,6 +58,65 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/workspace/{workspace_id}/spaces/{space_id}/permission")
         .route(web::get().to(space_permission_handler)),
+    )
+    // --- batch 2 ---
+    .service(
+      web::resource("/api/workspace/{workspace_id}/collab/{object_id}/collab-exists")
+        .route(web::get().to(collab_exists_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/workspace-profile")
+        .route(web::get().to(workspace_profile_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/view/{view_id}/navigation")
+        .route(web::get().to(view_navigation_handler)),
+    )
+    .service(
+      web::resource("/api/sharing/workspace/{workspace_id}/view/{view_id}")
+        .route(web::get().to(shared_with_me_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/document/{view_id}/inline-comment")
+        .route(web::get().to(inline_comments_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/document/{view_id}/inline-comment/reaction")
+        .route(web::get().to(inline_comment_reactions_handler)),
+    )
+    .service(
+      web::resource(
+        "/api/workspace/{workspace_id}/database/{view_id}/row/{row_id}/comment/notification",
+      )
+      .route(web::post().to(row_comment_notification_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/notifications")
+        .route(web::get().to(notifications_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/notifications/unread-count")
+        .route(web::get().to(notifications_unread_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/notifications/{action}")
+        .route(web::post().to(notifications_action_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/spaces/{space_id}")
+        .route(web::patch().to(update_structured_space_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/spaces/{space_id}/members")
+        .route(web::get().to(space_members_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/groups")
+        .route(web::get().to(workspace_groups_handler)),
+    )
+    .service(
+      web::resource("/api/workspace/{workspace_id}/page-view/{view_id}/upgrade-database-container")
+        .route(web::get().to(upgrade_database_container_status_handler)),
     );
 }
 
@@ -373,5 +435,263 @@ async fn space_permission_handler(
     "can_invite_members": is_editor,
     "can_edit_sidebar": is_editor,
     "explicit_member_count": 0,
+  }))))
+}
+
+// ---------------------------------------------------------------------------
+// Batch 2: profile, row pages, comments, notifications, spaces
+// ---------------------------------------------------------------------------
+
+/// GET /api/workspace/{workspace_id}/collab/{object_id}/collab-exists
+/// Used before opening the notes area of a database row.
+async fn collab_exists_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, object_id) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  let exists = select_collab_id_exists(&state.pg_pool, &object_id)
+    .await
+    .map_err(AppError::from)?;
+  Ok(Json(AppResponse::Ok().with_data(json!({ "exists": exists }))))
+}
+
+/// GET /api/workspace/{workspace_id}/workspace-profile
+/// The signed-in user's own profile in this workspace.
+async fn workspace_profile_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let workspace_id = workspace_id.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let person_id: Uuid = *user_uuid;
+  let person = get_workspace_mentionable_person(&state.pg_pool, &workspace_id, &person_id).await?;
+  let mut value = serde_json::to_value(&person)
+    .map_err(|err| AppError::Internal(anyhow::anyhow!("profile encode failed: {}", err)))?;
+  if let Some(obj) = value.as_object_mut() {
+    obj.insert("uid".to_string(), json!(uid.to_string()));
+    obj.insert("person_id".to_string(), json!(person_id.to_string()));
+    obj
+      .entry("last_mentioned_at".to_string())
+      .or_insert(Value::Null);
+  }
+  Ok(Json(AppResponse::Ok().with_data(value)))
+}
+
+/// GET /api/workspace/{workspace_id}/view/{view_id}/navigation
+/// Returns the workspace tree; the web client finds the path to the view in it.
+async fn view_navigation_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+  req: HttpRequest,
+) -> ActixResult<Json<AppResponse<FolderView>>> {
+  let (workspace_id, _view_id) = path.into_inner();
+  let tree = load_view(
+    &state,
+    &req,
+    &user_uuid,
+    workspace_id,
+    workspace_id,
+    MAX_FOLDER_DEPTH,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok().with_data(tree)))
+}
+
+/// GET /api/sharing/workspace/{workspace_id}/view/{view_id}
+/// "Shared with me": this server has no per-page sharing, so it is empty.
+async fn shared_with_me_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<FolderView>>> {
+  let (workspace_id, view_id) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  let root = FolderView {
+    view_id,
+    name: "Shared with me".to_string(),
+    ..Default::default()
+  };
+  Ok(Json(AppResponse::Ok().with_data(root)))
+}
+
+/// GET .../document/{view_id}/inline-comment (no margin comments stored yet)
+async fn inline_comments_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, _view_id) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(json!({
+    "comments": [],
+    "has_more": false,
+    "next_offset": Value::Null,
+  }))))
+}
+
+/// GET .../document/{view_id}/inline-comment/reaction
+async fn inline_comment_reactions_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, _view_id) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(json!({ "reactions": [] }))))
+}
+
+/// POST .../row/{row_id}/comment/notification
+/// Row comments are saved inside the row itself; this only acknowledges the
+/// "notify people" step (CareHub has no notification emails yet).
+async fn row_comment_notification_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<()>>> {
+  let (workspace_id, _view_id, _row_id) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
+/// GET /api/workspace/{workspace_id}/notifications
+async fn notifications_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let workspace_id = workspace_id.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(json!({
+    "notifications": [],
+    "has_more": false,
+  }))))
+}
+
+/// GET /api/workspace/{workspace_id}/notifications/unread-count
+async fn notifications_unread_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let workspace_id = workspace_id.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(json!({ "unread_count": 0 }))))
+}
+
+/// POST /api/workspace/{workspace_id}/notifications/{read|read-all|archive|archive-all}
+async fn notifications_action_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, String)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<()>>> {
+  let (workspace_id, _action) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateStructuredSpaceBody {
+  name: Option<String>,
+  space_icon: Option<String>,
+  space_icon_color: Option<String>,
+}
+
+fn extra_str(extra: &Option<Value>, key: &str) -> String {
+  extra
+    .as_ref()
+    .and_then(|e| e.get(key))
+    .and_then(|v| v.as_str())
+    .unwrap_or_default()
+    .to_string()
+}
+
+/// PATCH /api/workspace/{workspace_id}/spaces/{space_id}
+/// Rename a space or change its icon (Manage Space > General).
+async fn update_structured_space_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  body: Json<UpdateStructuredSpaceBody>,
+  state: Data<AppState>,
+  req: HttpRequest,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, space_id) = path.into_inner();
+  let body = body.into_inner();
+  let current = load_view(&state, &req, &user_uuid, workspace_id, space_id, 0).await?;
+  let is_private = current
+    .extra
+    .as_ref()
+    .and_then(|e| e.get("space_permission"))
+    .and_then(|v| v.as_i64())
+    == Some(1);
+  let permission = if is_private {
+    SpacePermission::Private
+  } else {
+    SpacePermission::PublicToAll
+  };
+  let name = body.name.unwrap_or_else(|| current.name.clone());
+  let icon = body
+    .space_icon
+    .unwrap_or_else(|| extra_str(&current.extra, "space_icon"));
+  let color = body
+    .space_icon_color
+    .unwrap_or_else(|| extra_str(&current.extra, "space_icon_color"));
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let user = realtime_user_for_web_request(req.headers(), uid)?;
+  update_space(
+    &state,
+    user,
+    workspace_id,
+    &space_id.to_string(),
+    &permission,
+    &name,
+    &icon,
+    &color,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok().with_data(
+    json!({ "view_id": space_id.to_string() }),
+  )))
+}
+
+/// GET /api/workspace/{workspace_id}/spaces/{space_id}/members
+/// Spaces are open to the whole workspace, so there are no extra members.
+async fn space_members_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, _space_id) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(json!({ "members": [], "groups": [] }))))
+}
+
+/// GET /api/workspace/{workspace_id}/groups (no groups on this server)
+async fn workspace_groups_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let workspace_id = workspace_id.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(json!({ "groups": [] }))))
+}
+
+/// GET .../page-view/{view_id}/upgrade-database-container
+/// Older databases stay as they are; nothing to upgrade.
+async fn upgrade_database_container_status_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, Uuid)>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let (workspace_id, _view_id) = path.into_inner();
+  workspace_role(&state, &user_uuid, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(json!({
+    "eligible": false,
+    "already_upgraded": false,
   }))))
 }

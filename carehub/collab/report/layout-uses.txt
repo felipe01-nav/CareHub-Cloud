@@ -1,0 +1,63 @@
+src/biz/collab/database.rs:41:    DatabaseLayout::Grid => resolve_grid_dependencies(fields),
+src/biz/collab/database.rs:42:    DatabaseLayout::Board => resolve_board_dependencies(fields),
+src/biz/collab/database.rs:43:    DatabaseLayout::Calendar => resolve_calendar_dependencies(fields),
+src/biz/collab/database.rs:50:    field_settings: default_field_settings_for_fields(fields, DatabaseLayout::Grid),
+src/biz/collab/database.rs:59:  let database_layout = DatabaseLayout::Board;
+src/biz/collab/database.rs:127:  let database_layout = DatabaseLayout::Calendar;
+src/biz/collab/database.rs:272:    let database_layout = DatabaseLayout::Grid;
+src/biz/collab/database.rs:288:    let database_layout = DatabaseLayout::Board;
+src/biz/collab/database.rs:331:    let database_layout = DatabaseLayout::Calendar;
+src/biz/collab/database.rs:350:      .get(&DatabaseLayout::Calendar)
+src/biz/collab/folder_view.rs:499:    CollabFolderViewLayout::Document => ViewLayout::Document,
+src/biz/collab/folder_view.rs:500:    CollabFolderViewLayout::Grid => ViewLayout::Grid,
+src/biz/collab/folder_view.rs:501:    CollabFolderViewLayout::Board => ViewLayout::Board,
+src/biz/collab/folder_view.rs:502:    CollabFolderViewLayout::Calendar => ViewLayout::Calendar,
+src/biz/collab/folder_view.rs:503:    CollabFolderViewLayout::Chat => ViewLayout::Chat,
+src/biz/collab/folder_view.rs:533:    ViewLayout::Document => collab_folder::ViewLayout::Document,
+src/biz/collab/folder_view.rs:534:    ViewLayout::Grid => collab_folder::ViewLayout::Grid,
+src/biz/collab/folder_view.rs:535:    ViewLayout::Board => collab_folder::ViewLayout::Board,
+src/biz/collab/folder_view.rs:536:    ViewLayout::Calendar => collab_folder::ViewLayout::Calendar,
+src/biz/collab/folder_view.rs:537:    ViewLayout::Chat => collab_folder::ViewLayout::Chat,
+src/biz/collab/utils.rs:509:        collab_folder::ViewLayout::Document,
+src/biz/workspace/publish_dup.rs:382:      ViewLayout::Document => {
+src/biz/workspace/publish_dup.rs:391:      ViewLayout::Grid | ViewLayout::Board | ViewLayout::Calendar => {
+src/biz/workspace/publish_dup.rs:413:    let mut ret_view = self.new_folder_view(dup_view_id, &metadata.view, ViewLayout::Document);
+src/biz/workspace/page_view.rs:248:    ViewLayout::Document => {
+src/biz/workspace/page_view.rs:262:    ViewLayout::Grid => create_grid_page(state, user, workspace_id, parent_view_id, name).await,
+src/biz/workspace/page_view.rs:263:    ViewLayout::Calendar => {
+src/biz/workspace/page_view.rs:266:    ViewLayout::Board => create_board_page(state, user, workspace_id, parent_view_id, name).await,
+src/biz/workspace/page_view.rs:267:    ViewLayout::Chat => create_chat_page(state, user, workspace_id, parent_view_id, name).await,
+src/biz/workspace/page_view.rs:416:    DatabaseLayout::Calendar,
+src/biz/workspace/page_view.rs:442:    DatabaseLayout::Grid,
+src/biz/workspace/page_view.rs:517:    DatabaseLayout::Board,
+src/biz/workspace/page_view.rs:1093:    collab_folder::ViewLayout::Document,
+src/biz/workspace/page_view.rs:1141:    collab_folder::ViewLayout::Grid,
+src/biz/workspace/page_view.rs:1167:    collab_folder::ViewLayout::Board,
+src/biz/workspace/page_view.rs:1193:    collab_folder::ViewLayout::Calendar,
+src/biz/workspace/page_view.rs:1346:    collab_folder::ViewLayout::Chat,
+src/biz/workspace/page_view.rs:1705:    collab_folder::ViewLayout::Document => {
+src/biz/workspace/page_view.rs:1708:    collab_folder::ViewLayout::Grid
+src/biz/workspace/page_view.rs:1709:    | collab_folder::ViewLayout::Board
+src/biz/workspace/page_view.rs:1710:    | collab_folder::ViewLayout::Calendar => {
+src/biz/workspace/page_view.rs:1721:    collab_folder::ViewLayout::Chat => Err(AppError::InvalidRequest(
+src/biz/workspace/page_view.rs:1921:      layout: ViewLayout::Document,
+src/biz/workspace/page_view.rs:1987:    collab_folder::ViewLayout::Document => {
+src/biz/workspace/page_view.rs:1990:    collab_folder::ViewLayout::Grid
+src/biz/workspace/page_view.rs:1991:    | collab_folder::ViewLayout::Board
+src/biz/workspace/page_view.rs:1992:    | collab_folder::ViewLayout::Calendar => {
+src/biz/workspace/page_view.rs:1995:    collab_folder::ViewLayout::Chat => Err(AppError::InvalidRequest(
+src/biz/workspace/page_view.rs:2164:    ViewLayout::Grid => DatabaseLayout::Grid,
+src/biz/workspace/page_view.rs:2165:    ViewLayout::Board => DatabaseLayout::Board,
+src/biz/workspace/page_view.rs:2166:    ViewLayout::Calendar => DatabaseLayout::Calendar,
+libs/workspace-template/src/document/vault_template.rs:47:    ViewLayout::Document
+libs/workspace-template/src/document/getting_started.rs:179:    ViewLayout::Document
+libs/workspace-template/src/document/getting_started.rs:247:            .with_layout(ViewLayout::Board)
+libs/workspace-template/src/document/getting_started.rs:310:    ViewLayout::Document
+libs/workspace-template/src/hierarchy_builder.rs:41:/// The default layout of the view is [ViewLayout::Document]
+libs/workspace-template/src/hierarchy_builder.rs:61:      layout: ViewLayout::Document,
+libs/shared-entity/src/dto/workspace_dto.rs:413:      ViewLayout::Document => "Document",
+libs/shared-entity/src/dto/workspace_dto.rs:414:      ViewLayout::Grid => "Grid",
+libs/shared-entity/src/dto/workspace_dto.rs:415:      ViewLayout::Board => "Board",
+libs/shared-entity/src/dto/workspace_dto.rs:416:      ViewLayout::Calendar => "Calendar",
+libs/shared-entity/src/dto/workspace_dto.rs:417:      ViewLayout::Chat => "Chat",
+services/appflowy-worker/src/import_worker/worker.rs:1045:      View::orphan_view(&orphan_view_id, ViewLayout::Document, Some(import_task.uid))

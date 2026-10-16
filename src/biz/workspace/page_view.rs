@@ -265,6 +265,12 @@ pub async fn create_page(
     },
     ViewLayout::Board => create_board_page(state, user, workspace_id, parent_view_id, name).await,
     ViewLayout::Chat => create_chat_page(state, user, workspace_id, parent_view_id, name).await,
+    // CareHub: newer database view types are added to an existing database
+    // (see create_database_view_for_layout), not created as new pages.
+    _ => Err(AppError::InvalidRequest(format!(
+      "Creating a new {} page is not supported; add it as a view of a database",
+      view_layout
+    ))),
   }
 }
 
@@ -1707,7 +1713,13 @@ pub async fn publish_page(
     },
     collab_folder::ViewLayout::Grid
     | collab_folder::ViewLayout::Board
-    | collab_folder::ViewLayout::Calendar => {
+    | collab_folder::ViewLayout::Calendar
+    | collab_folder::ViewLayout::Chart
+    | collab_folder::ViewLayout::List
+    | collab_folder::ViewLayout::Gallery
+    | collab_folder::ViewLayout::Feed
+    | collab_folder::ViewLayout::Form
+    | collab_folder::ViewLayout::Timeline => {
       generate_publish_data_for_database(
         &state.pg_pool,
         &state.collab_storage,
@@ -1989,7 +2001,13 @@ async fn get_page_view_collab_for_view_with_parent(
     },
     collab_folder::ViewLayout::Grid
     | collab_folder::ViewLayout::Board
-    | collab_folder::ViewLayout::Calendar => {
+    | collab_folder::ViewLayout::Calendar
+    | collab_folder::ViewLayout::Chart
+    | collab_folder::ViewLayout::List
+    | collab_folder::ViewLayout::Gallery
+    | collab_folder::ViewLayout::Feed
+    | collab_folder::ViewLayout::Form
+    | collab_folder::ViewLayout::Timeline => {
       get_page_collab_data_for_database(pg_pool, collab_storage, uid, workspace_id, view_id).await
     },
     collab_folder::ViewLayout::Chat => Err(AppError::InvalidRequest(
@@ -2160,16 +2178,57 @@ pub async fn create_database_view(
   view_layout: &ViewLayout,
   name: Option<&str>,
 ) -> Result<(), AppError> {
-  let database_layout = match view_layout {
-    ViewLayout::Grid => DatabaseLayout::Grid,
-    ViewLayout::Board => DatabaseLayout::Board,
-    ViewLayout::Calendar => DatabaseLayout::Calendar,
-    _ => {
-      return Err(AppError::InvalidRequest(
-        "The layout type is not supported for database view creation".to_string(),
-      ))
-    },
-  };
+  create_database_view_for_layout(
+    state,
+    user,
+    workspace_id,
+    database_view_id,
+    None,
+    view_layout,
+    name,
+  )
+  .await
+  .map(|_| ())
+}
+
+/// CareHub: the folder view type -> database view type, for every database view
+/// type the web app knows (Grid, Board, Calendar, Chart, List, Gallery, Feed,
+/// Form, Timeline).
+pub fn database_layout_for_view_layout(view_layout: &ViewLayout) -> Option<DatabaseLayout> {
+  match view_layout {
+    ViewLayout::Grid => Some(DatabaseLayout::Grid),
+    ViewLayout::Board => Some(DatabaseLayout::Board),
+    ViewLayout::Calendar => Some(DatabaseLayout::Calendar),
+    ViewLayout::Chart => Some(DatabaseLayout::Chart),
+    ViewLayout::List => Some(DatabaseLayout::List),
+    ViewLayout::Gallery => Some(DatabaseLayout::Gallery),
+    ViewLayout::Feed => Some(DatabaseLayout::Feed),
+    ViewLayout::Form => Some(DatabaseLayout::Form),
+    ViewLayout::Timeline => Some(DatabaseLayout::Timeline),
+    ViewLayout::Document | ViewLayout::Chat => None,
+  }
+}
+
+/// CareHub: adds a new view (of any database view type) to the database that
+/// `database_view_id` belongs to. The new view is placed under
+/// `parent_view_id` in the sidebar (default: under `database_view_id`).
+/// Returns (new view id, database id, database update) so the web app can
+/// show the new view straight away.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_database_view_for_layout(
+  state: &AppState,
+  user: RealtimeUser,
+  workspace_id: Uuid,
+  database_view_id: &Uuid,
+  parent_view_id: Option<Uuid>,
+  view_layout: &ViewLayout,
+  name: Option<&str>,
+) -> Result<(Uuid, Uuid, Vec<u8>), AppError> {
+  let database_layout = database_layout_for_view_layout(view_layout).ok_or_else(|| {
+    AppError::InvalidRequest(
+      "The layout type is not supported for database view creation".to_string(),
+    )
+  })?;
 
   let client_id = default_client_id();
   let timestamp = collab_database::database::timestamp();
@@ -2265,9 +2324,10 @@ pub async fn create_database_view(
   )
   .await?;
   let mut folder = state.ws_server.get_folder(workspace_id).await?;
+  let folder_parent_id = parent_view_id.unwrap_or(*database_view_id);
   let folder_update = add_new_view_to_folder(
     uid,
-    database_view_id,
+    &folder_parent_id,
     &new_view_id,
     &mut folder,
     name,
@@ -2281,7 +2341,7 @@ pub async fn create_database_view(
     user.clone(),
     workspace_id,
     database_id,
-    database_encoded_update,
+    database_encoded_update.clone(),
   )
   .await?;
   update_workspace_database_data(
@@ -2302,7 +2362,7 @@ pub async fn create_database_view(
   )
   .await?;
 
-  Ok(())
+  Ok((new_view_id, database_id, database_encoded_update))
 }
 
 #[instrument(level = "debug", skip_all)]

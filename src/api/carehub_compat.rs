@@ -37,6 +37,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
   super::carehub_forms::configure(cfg);
   // CareHub: Settings > User accounts (administrator only) – see carehub_admin.rs
   super::carehub_admin::configure(cfg);
+  // CareHub: personal Calendar page – see carehub_calendar.rs
+  super::carehub_calendar::configure(cfg);
   cfg
     .service(
       web::resource("/api/workspace/{workspace_id}/view/{view_id}")

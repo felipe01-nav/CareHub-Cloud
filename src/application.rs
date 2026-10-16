@@ -244,8 +244,11 @@ pub async fn init_state(config: &Config) -> Result<AppState, Error> {
   )
   .await?;
 
-  info!("Setup AppFlowy AI: {}", config.appflowy_ai.url());
-  let appflowy_ai_client = AppFlowyAIClient::new(&config.appflowy_ai.url());
+  // CareHub: with a Claude key set, AI requests are answered by carehub_ai.rs.
+  let ai_url = crate::api::carehub_ai::ai_service_url(config.application.port)
+    .unwrap_or_else(|| config.appflowy_ai.url());
+  info!("Setup AppFlowy AI: {}", ai_url);
+  let appflowy_ai_client = AppFlowyAIClient::new(&ai_url);
   // Pg listeners
   info!("Setting up Pg listeners...");
   let pg_listeners = Arc::new(PgListeners::new(&pg_pool).await?);

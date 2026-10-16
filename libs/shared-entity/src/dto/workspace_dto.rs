@@ -268,6 +268,9 @@ pub struct DuplicatePageParams {
 pub struct CreatePageDatabaseViewParams {
   pub layout: ViewLayout,
   pub name: Option<String>,
+  /// CareHub: newer web clients send the parent of the new view.
+  #[serde(default)]
+  pub parent_view_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +408,13 @@ pub enum ViewLayout {
   Board = 2,
   Calendar = 3,
   Chat = 4,
+  // CareHub: newer view types used by the current web app
+  Chart = 5,
+  List = 6,
+  Gallery = 7,
+  Feed = 8,
+  Form = 9,
+  Timeline = 10,
 }
 
 impl std::fmt::Display for ViewLayout {
@@ -415,6 +425,12 @@ impl std::fmt::Display for ViewLayout {
       ViewLayout::Board => "Board",
       ViewLayout::Calendar => "Calendar",
       ViewLayout::Chat => "Chat",
+      ViewLayout::Chart => "Chart",
+      ViewLayout::List => "List",
+      ViewLayout::Gallery => "Gallery",
+      ViewLayout::Feed => "Feed",
+      ViewLayout::Form => "Form",
+      ViewLayout::Timeline => "Timeline",
     };
     write!(f, "{}", s)
   }

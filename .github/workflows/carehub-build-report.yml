@@ -1,6 +1,7 @@
-# CareHub: when the server image build fails, save the failing log lines to
-# carehub/report/server-build-failure.txt so they can be read without the
-# GitHub website.
+# CareHub: after every server image build, save the result to
+# carehub/report/server-build-status.txt, and when it fails also save the
+# failing log lines to carehub/report/server-build-failure.txt, so they can be
+# read without the GitHub website.
 name: CareHub - report build failures
 on:
   workflow_run:
@@ -9,27 +10,36 @@ on:
 permissions:
   contents: write
   actions: read
+concurrency:
+  group: carehub-server-report
+  cancel-in-progress: false
 jobs:
   report:
-    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
-      - name: Save the failing log lines
+      - name: Save the build result
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RESULT: ${{ github.event.workflow_run.conclusion }}
+          FINISHED: ${{ github.event.workflow_run.updated_at }}
         run: |
           mkdir -p carehub/report
-          {
-            echo "run $RUN_ID commit $RUN_SHA"
-            gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed | grep -v "^\s*$" | tail -400
-          } > carehub/report/server-build-failure.txt 2>&1 || true
+          echo "result $RESULT run $RUN_ID commit $RUN_SHA finished $FINISHED" > carehub/report/server-build-status.txt
+          if [ "$RESULT" = "failure" ]; then
+            {
+              echo "run $RUN_ID commit $RUN_SHA"
+              gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed | grep -v "^\s*$" | tail -400
+            } > carehub/report/server-build-failure.txt 2>&1 || true
+          fi
           git config user.name "carehub-check"
           git config user.email "carehub-check@users.noreply.github.com"
           git add carehub/report
-          git commit -m "CareHub build failure report [skip ci]" || exit 0
+          git commit -m "CareHub build report [skip ci]" || exit 0
+          git pull --rebase origin main || true
           git push

@@ -40,6 +40,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
   // CareHub: personal Calendar page – see carehub_calendar.rs
   super::carehub_calendar::configure(cfg);
   super::carehub_icloud::configure(cfg);
+  // CareHub: Messages (direct and group chats) – see carehub_messages.rs
+  super::carehub_messages::configure(cfg);
   cfg
     .service(
       web::resource("/api/workspace/{workspace_id}/view/{view_id}")

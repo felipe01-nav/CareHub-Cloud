@@ -5,12 +5,16 @@
 //! * You can only start a chat with people who are in one of your workspaces.
 //! * The browser asks for new messages every few seconds; unread counts come
 //!   from the time each member last opened the chat.
+//! * A message can carry page cards, written as `[[page:WORKSPACE:VIEW|Title]]`.
+//!   When the sender agrees, chat members who are not yet in that page's
+//!   workspace are added to it (as members) so they can open the page.
 
 use crate::biz::authentication::jwt::UserUuid;
 use crate::state::AppState;
 use actix_web::web::{self, Data, Json};
 use actix_web::Result as ActixResult;
 use app_error::AppError;
+use database_entity::dto::AFRole;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use shared_entity::response::AppResponse;
@@ -40,6 +44,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
       web::resource("/api/carehub/messages/chats/{chat_id}/messages")
         .route(web::get().to(list_messages_handler))
         .route(web::post().to(send_message_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/messages/chats/{chat_id}/share-check")
+        .route(web::post().to(share_check_handler)),
     )
     .service(
       web::resource("/api/carehub/messages/chats/{chat_id}/read")
@@ -535,6 +543,142 @@ async fn list_messages_handler(
 #[derive(Debug, Deserialize)]
 struct SendBody {
   body: String,
+  /// Add chat members to the workspaces of shared pages, so they can open them.
+  #[serde(default)]
+  grant: bool,
+}
+
+// ---------------------------------------------------------------------------
+// shared pages
+// ---------------------------------------------------------------------------
+
+/// (workspace_id, view_id) of every `[[page:WORKSPACE:VIEW|Title]]` in a message.
+fn shared_pages(text: &str) -> Vec<(Uuid, Uuid)> {
+  let mut found: Vec<(Uuid, Uuid)> = Vec::new();
+  let mut rest = text;
+  while let Some(start) = rest.find("[[page:") {
+    let after = &rest[start + 7..];
+    let end = match after.find("]]") {
+      Some(end) => end,
+      None => break,
+    };
+    let inner = &after[..end];
+    let ids = inner.split('|').next().unwrap_or("");
+    let mut parts = ids.split(':');
+    if let (Some(ws), Some(view)) = (parts.next(), parts.next()) {
+      if let (Ok(ws), Ok(view)) = (Uuid::parse_str(ws.trim()), Uuid::parse_str(view.trim())) {
+        if !found.contains(&(ws, view)) {
+          found.push((ws, view));
+        }
+      }
+    }
+    rest = &after[end + 2..];
+    if found.len() >= 20 {
+      break;
+    }
+  }
+  found
+}
+
+/// The sender may give access when they are an owner or member of the workspace.
+async fn can_grant(state: &AppState, workspace_id: Uuid, uid: i64) -> Result<bool, AppError> {
+  let role: Option<i32> =
+    sqlx::query_scalar("SELECT role_id FROM af_workspace_member WHERE workspace_id = $1 AND uid = $2")
+      .bind(workspace_id)
+      .bind(uid)
+      .fetch_optional(&state.pg_pool)
+      .await?;
+  let owner: i32 = AFRole::Owner.into();
+  let member: i32 = AFRole::Member.into();
+  Ok(matches!(role, Some(r) if r == owner || r == member))
+}
+
+/// Chat members (other than `uid`) who are not in the workspace yet: (uid, name).
+async fn missing_members(
+  state: &AppState,
+  chat_id: Uuid,
+  workspace_id: Uuid,
+  uid: i64,
+) -> Result<Vec<(i64, String)>, AppError> {
+  let rows: Vec<(i64, String)> = sqlx::query_as(
+    "SELECT u.uid, COALESCE(NULLIF(u.name, ''), u.email, '') FROM carehub_chat_member m      JOIN af_user u ON u.uid = m.uid      WHERE m.chat_id = $1 AND m.uid <> $3 AND NOT EXISTS (       SELECT 1 FROM af_workspace_member w WHERE w.workspace_id = $2 AND w.uid = m.uid)      ORDER BY m.joined_ms, u.uid",
+  )
+  .bind(chat_id)
+  .bind(workspace_id)
+  .bind(uid)
+  .fetch_all(&state.pg_pool)
+  .await?;
+  Ok(rows)
+}
+
+async fn add_to_workspace(state: &AppState, member: i64, workspace_id: Uuid) -> Result<(), AppError> {
+  let role_id: i32 = AFRole::Member.into();
+  sqlx::query(
+    "INSERT INTO af_workspace_member (workspace_id, uid, role_id) VALUES ($1, $2, $3) \
+     ON CONFLICT (workspace_id, uid) DO NOTHING",
+  )
+  .bind(workspace_id)
+  .bind(member)
+  .bind(role_id)
+  .execute(&state.pg_pool)
+  .await?;
+  state
+    .workspace_access_control
+    .insert_role(&member, &workspace_id, AFRole::Member)
+    .await?;
+  Ok(())
+}
+
+/// Give everyone in the chat access to the shared pages. Returns who was added.
+async fn grant_pages(state: &AppState, chat_id: Uuid, uid: i64, text: &str) -> Result<Vec<String>, AppError> {
+  let mut added: Vec<String> = Vec::new();
+  let mut workspaces: Vec<Uuid> = Vec::new();
+  for (ws, _) in shared_pages(text) {
+    if !workspaces.contains(&ws) {
+      workspaces.push(ws);
+    }
+  }
+  for ws in workspaces {
+    if !can_grant(state, ws, uid).await? {
+      continue;
+    }
+    for (member, name) in missing_members(state, chat_id, ws, uid).await? {
+      add_to_workspace(state, member, ws).await?;
+      if !added.contains(&name) {
+        added.push(name);
+      }
+    }
+  }
+  Ok(added)
+}
+
+#[derive(Debug, Deserialize)]
+struct ShareCheckBody {
+  body: String,
+}
+
+/// POST /api/carehub/messages/chats/{chat_id}/share-check { body }
+/// Who in the chat cannot open the pages in this message yet.
+async fn share_check_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<Uuid>,
+  body: Json<ShareCheckBody>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let uid = me(&state, &user_uuid).await?;
+  let chat_id = path.into_inner();
+  require_member(&state, chat_id, uid).await?;
+  let mut pages: Vec<Value> = Vec::new();
+  for (ws, view) in shared_pages(&body.body) {
+    let missing = missing_members(&state, chat_id, ws, uid).await?;
+    pages.push(json!({
+      "workspace_id": ws,
+      "view_id": view,
+      "can_grant": can_grant(&state, ws, uid).await?,
+      "missing": missing.iter().map(|(_, name)| name.clone()).collect::<Vec<_>>(),
+    }));
+  }
+  Ok(Json(AppResponse::Ok().with_data(json!({ "pages": pages }))))
 }
 
 /// POST /api/carehub/messages/chats/{chat_id}/messages { body }
@@ -586,9 +730,16 @@ async fn send_message_handler(
     .execute(&state.pg_pool)
     .await
     .map_err(AppError::from)?;
+  let granted = if body.grant {
+    grant_pages(&state, chat_id, uid, text).await?
+  } else {
+    Vec::new()
+  };
   let members = members_of(&state, chat_id).await?;
   let row: MessageRow = (id, uid, text.to_string(), now, 0, false);
-  Ok(Json(AppResponse::Ok().with_data(message_json(&row, uid, &members))))
+  let mut answer = message_json(&row, uid, &members);
+  answer["granted"] = json!(granted);
+  Ok(Json(AppResponse::Ok().with_data(answer)))
 }
 
 /// POST /api/carehub/messages/chats/{chat_id}/read

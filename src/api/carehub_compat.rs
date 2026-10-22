@@ -47,6 +47,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
   super::carehub_ai::configure(cfg);
   // CareHub: the Claude assistant panel – see carehub_assistant.rs
   super::carehub_assistant::configure(cfg);
+  // CareHub: roles, analytics, page versions, reminders, automations, status – see carehub_extras.rs
+  super::carehub_extras::configure(cfg);
   cfg
     .service(
       web::resource("/api/workspace/{workspace_id}/view/{view_id}")
@@ -371,6 +373,7 @@ async fn database_view_creation_status_handler(
 
 /// Access levels used by the web client.
 const ACCESS_READ_ONLY: i32 = 10;
+const ACCESS_READ_AND_COMMENT: i32 = 20;
 const ACCESS_READ_AND_WRITE: i32 = 30;
 const ACCESS_FULL: i32 = 50;
 
@@ -416,11 +419,26 @@ async fn collab_permission_handler(
 ) -> ActixResult<Json<AppResponse<Value>>> {
   let (workspace_id, object_id) = path.into_inner();
   let role = workspace_role(&state, &user_uuid, &workspace_id).await?;
-  let (access_level, can_write, can_share) = match role {
+  let (mut access_level, mut can_write, mut can_share) = match role {
     AFRole::Owner => (ACCESS_FULL, true, true),
     AFRole::Member => (ACCESS_READ_AND_WRITE, true, true),
     AFRole::Guest => (ACCESS_READ_ONLY, false, false),
   };
+  let mut can_comment = can_write;
+  // CareHub roles (Settings > Roles & permissions) can narrow this further.
+  if !matches!(role, AFRole::Guest) {
+    let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+    if let Some((edit, comment, share, _create)) =
+      super::carehub_extras::collab_caps(&state.pg_pool, workspace_id, uid).await
+    {
+      if !edit {
+        can_write = false;
+        access_level = if comment { ACCESS_READ_AND_COMMENT } else { ACCESS_READ_ONLY };
+      }
+      can_comment = edit || comment;
+      can_share = can_share && share;
+    }
+  }
   Ok(Json(AppResponse::Ok().with_data(json!({
     "object_id": object_id.to_string(),
     "collab_type": query.collab_type.unwrap_or(0),
@@ -428,7 +446,7 @@ async fn collab_permission_handler(
     "access_level": access_level,
     "can_read": true,
     "can_write": can_write,
-    "can_comment": can_write,
+    "can_comment": can_comment,
     "can_share": can_share,
   }))))
 }
@@ -461,7 +479,15 @@ async fn space_permission_handler(
     == Some(1);
   let visibility = if is_private { "private" } else { "public" };
   let is_owner = matches!(role, AFRole::Owner) || (is_creator && !matches!(role, AFRole::Guest));
-  let is_editor = !matches!(role, AFRole::Guest);
+  let mut is_editor = !matches!(role, AFRole::Guest);
+  // CareHub roles: people who may not create pages can't change the sidebar.
+  if is_editor {
+    if let Some((_, _, _, create)) =
+      super::carehub_extras::collab_caps(&state.pg_pool, workspace_id, uid).await
+    {
+      is_editor = create;
+    }
+  }
   let current_level = match role {
     AFRole::Owner => ACCESS_FULL,
     AFRole::Member => ACCESS_READ_AND_WRITE,

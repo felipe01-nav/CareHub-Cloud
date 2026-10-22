@@ -79,7 +79,7 @@ fn now_ms() -> i64 {
     .unwrap_or(0)
 }
 
-async fn ensure_tables(pool: &sqlx::PgPool) -> Result<(), AppError> {
+pub(crate) async fn ensure_tables(pool: &sqlx::PgPool) -> Result<(), AppError> {
   if TABLES_READY.load(Ordering::Relaxed) {
     return Ok(());
   }
@@ -213,7 +213,9 @@ async fn chat_json(state: &AppState, chat_id: Uuid, uid: i64) -> Result<Value, A
         "body": if deleted { String::new() } else { clip(&body, 200) },
         "deleted": deleted,
         "mine": sender == uid,
-        "sender_name": who.map(|p| if p.2.is_empty() { p.3.clone() } else { p.2.clone() }).unwrap_or_default(),
+        "sender_name": who
+          .map(|p| if p.2.is_empty() { p.3.clone() } else { p.2.clone() })
+          .unwrap_or_else(|| if sender == 0 { "Care Hub".to_string() } else { String::new() }),
         "created_at": created,
       })
     },

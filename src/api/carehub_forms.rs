@@ -1372,6 +1372,7 @@ async fn public_form_submit_handler(
 
   // Build the new row.
   let workspace_id = share.workspace_id;
+  let carehub_form_view = share.view_id;
   let database_id = share.database_id;
   let storage_uid = respondent_uid.unwrap_or(share.created_by);
   let row_uuid = Uuid::new_v4();
@@ -1470,6 +1471,9 @@ async fn public_form_submit_handler(
     )
     .await
     .map_err(AppError::from)?;
+
+  // CareHub automations: "When a form gets a response".
+  crate::api::carehub_extras::on_form_submitted(state.pg_pool.clone(), workspace_id, carehub_form_view);
 
   Ok(HttpResponse::Ok().json(json!({
     "submission_id": row_uuid.to_string(),

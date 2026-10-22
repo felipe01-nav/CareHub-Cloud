@@ -321,6 +321,8 @@ pub async fn init_state(config: &Config) -> Result<AppState, Error> {
   ));
 
   let mailer = get_mailer(&config.mailer).await?;
+  // CareHub: reminders, scheduled automations, uptime and clean-up.
+  crate::api::carehub_extras::start_background(pg_pool.clone());
   if config.notification.enable_email_notification {
     info!("Setting up background notification worker...");
     let email_notification_interval = config.notification.email_notification_interval_secs;

@@ -151,11 +151,15 @@ async fn caller_email(state: &AppState, user_uuid: &UserUuid) -> Result<String, 
 
 async fn is_admin(state: &AppState, user_uuid: &UserUuid) -> Result<bool, AppError> {
   let admins = admin_emails();
-  if admins.is_empty() {
+  let email = caller_email(state, user_uuid).await?;
+  if email.is_empty() {
     return Ok(false);
   }
-  let email = caller_email(state, user_uuid).await?;
-  Ok(!email.is_empty() && admins.contains(&email))
+  if admins.contains(&email) {
+    return Ok(true);
+  }
+  // CareHub roles: people given the Admin role in Settings > Roles & permissions.
+  Ok(super::carehub_extras::is_assigned_admin(&state.pg_pool, &email).await)
 }
 
 async fn require_admin(state: &AppState, user_uuid: &UserUuid) -> Result<(), AppError> {

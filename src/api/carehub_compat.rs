@@ -348,14 +348,14 @@ async fn list_database_handler(
 }
 
 /// GET /api/workspace/{workspace_id}/database-view-creation-status
-/// Forms are provided by carehub_forms.rs; charts are not available yet.
+/// Forms and charts are created through carehub_forms.rs (any view type).
 async fn database_view_creation_status_handler(
   _user_uuid: UserUuid,
   _workspace_id: web::Path<Uuid>,
 ) -> ActixResult<Json<AppResponse<Value>>> {
   Ok(Json(AppResponse::Ok().with_data(json!({
     "can_create_form": true,
-    "can_create_chart": false,
+    "can_create_chart": true,
   }))))
 }
 

@@ -324,10 +324,14 @@ async fn list_users_handler(
     }
   }
   // Mark who has signed in, who is in the current workspace, who will join.
-  let signed_in: Vec<Uuid> = sqlx::query_scalar("SELECT uuid FROM af_user")
-    .fetch_all(&state.pg_pool)
-    .await
-    .map_err(AppError::from)?;
+  // Profile name and picture come from the user's own profile settings.
+  let profiles: Vec<(Uuid, String, String)> = sqlx::query_as(
+    "SELECT uuid, COALESCE(name, ''), COALESCE(metadata->>'icon_url', '') FROM af_user",
+  )
+  .fetch_all(&state.pg_pool)
+  .await
+  .map_err(AppError::from)?;
+  let signed_in: Vec<Uuid> = profiles.iter().map(|(id, _, _)| *id).collect();
   let (members, pending): (Vec<Uuid>, Vec<String>) = match query.workspace_id {
     Some(workspace_id) => {
       let members: Vec<Uuid> = sqlx::query_scalar(
@@ -364,6 +368,9 @@ async fn list_users_handler(
     user["has_signed_in"] = json!(has_signed_in);
     user["in_workspace"] = json!(in_workspace);
     user["joins_workspace"] = json!(!in_workspace && pending.contains(&email));
+    let profile = id.and_then(|id| profiles.iter().find(|(uuid, _, _)| *uuid == id));
+    user["name"] = json!(profile.map(|(_, name, _)| name.trim().to_string()).unwrap_or_default());
+    user["avatar"] = json!(profile.map(|(_, _, icon)| icon.clone()).unwrap_or_default());
   }
   users.sort_by(|a, b| {
     let ea = a.get("email").and_then(|v| v.as_str()).unwrap_or_default();

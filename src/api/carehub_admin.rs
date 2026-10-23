@@ -21,6 +21,8 @@ use shared_entity::response::AppResponse;
 use uuid::Uuid;
 
 const MIN_PASSWORD_LEN: usize = 6;
+/// Longest name accepted when an account is made (counted in characters).
+const MAX_NAME_CHARS: usize = 100;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
   cfg
@@ -57,6 +59,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 struct CreateUserBody {
   email: String,
   password: String,
+  /// Optional: the person's name. It becomes their name in Care Hub at their first sign-in.
+  #[serde(default)]
+  name: Option<String>,
   /// Optional: also make the new person a member of this workspace.
   workspace_id: Option<Uuid>,
 }
@@ -186,6 +191,37 @@ fn check_password(password: &str) -> Result<(), AppError> {
     )));
   }
   Ok(())
+}
+
+/// Characters that flip the direction of the text around them (they can make a name
+/// look different from what it is), so they are left out of names.
+fn is_bidi_control(c: char) -> bool {
+  matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The name sent when an account is made: control characters removed, spaces trimmed
+/// and runs of spaces (or tabs and line breaks) made into one space.
+/// `None` when no name was given or nothing is left, which means "no name", as before.
+fn clean_name(raw: Option<&str>) -> Result<Option<String>, AppError> {
+  let raw = match raw {
+    Some(raw) => raw,
+    None => return Ok(None),
+  };
+  let kept: String = raw
+    .chars()
+    .filter(|c| c.is_whitespace() || !(c.is_control() || is_bidi_control(*c)))
+    .collect();
+  let name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+  if name.is_empty() {
+    return Ok(None);
+  }
+  if name.chars().count() > MAX_NAME_CHARS {
+    return Err(AppError::InvalidRequest(format!(
+      "The name can be at most {} characters.",
+      MAX_NAME_CHARS
+    )));
+  }
+  Ok(Some(name))
 }
 
 /// The rules people see in the app: 8+ characters, upper and lower case, a symbol.
@@ -322,6 +358,20 @@ async fn ensure_pending_table(pool: &sqlx::PgPool) -> Result<(), AppError> {
   Ok(())
 }
 
+/// Puts the name on the person's Care Hub profile, if they already have one.
+/// (A new account usually doesn't: the profile is made at the first sign-in,
+/// from the name saved with the sign-in account.)
+async fn set_profile_name(pool: &sqlx::PgPool, id: &Uuid, name: &str) {
+  if let Err(err) = sqlx::query("UPDATE af_user SET name = $1 WHERE uuid = $2")
+    .bind(name)
+    .bind(id)
+    .execute(pool)
+    .await
+  {
+    tracing::warn!("carehub_admin: could not save the name on the profile: {}", err);
+  }
+}
+
 /// The sign-in id -> server profile (uid, email), if the person has signed in before.
 async fn profile_for(pool: &sqlx::PgPool, id: &Uuid) -> Result<Option<(i64, String)>, AppError> {
   let row = sqlx::query_as::<_, (i64, String)>("SELECT uid, email FROM af_user WHERE uuid = $1")
@@ -406,6 +456,16 @@ fn slim_user(user: &Value) -> Value {
   })
 }
 
+/// The name saved with the sign-in account when it was made (user_metadata.name),
+/// tidied like when it was saved. Empty when there is none.
+fn saved_name(user: &Value) -> String {
+  let raw = user
+    .get("user_metadata")
+    .and_then(|m| m.get("name"))
+    .and_then(|v| v.as_str());
+  clean_name(raw).ok().flatten().unwrap_or_default()
+}
+
 /// GET /api/carehub/admin/me -> { "is_admin": bool }
 async fn admin_me_handler(
   user_uuid: UserUuid,
@@ -422,6 +482,7 @@ async fn admin_me_handler(
 }
 
 /// GET /api/carehub/admin/users -> { "users": [...] }
+/// "name" is the profile name; before the first sign-in it is the name saved when the account was made.
 async fn list_users_handler(
   user_uuid: UserUuid,
   query: web::Query<WorkspaceQuery>,
@@ -443,7 +504,12 @@ async fn list_users_handler(
       .cloned()
       .unwrap_or_default();
     let count = batch.len();
-    users.extend(batch.iter().map(slim_user));
+    users.extend(batch.iter().map(|user| {
+      let mut slim = slim_user(user);
+      // Shown until the first sign-in; after that the profile name is used (below).
+      slim["name"] = json!(saved_name(user));
+      slim
+    }));
     if count < 100 {
       break;
     }
@@ -494,7 +560,9 @@ async fn list_users_handler(
     user["in_workspace"] = json!(in_workspace);
     user["joins_workspace"] = json!(!in_workspace && pending.contains(&email));
     let profile = id.and_then(|id| profiles.iter().find(|(uuid, _, _)| *uuid == id));
-    user["name"] = json!(profile.map(|(_, name, _)| name.trim().to_string()).unwrap_or_default());
+    if let Some((_, name, _)) = profile {
+      user["name"] = json!(name.trim());
+    }
     user["avatar"] = json!(profile.map(|(_, _, icon)| icon.clone()).unwrap_or_default());
   }
   users.sort_by(|a, b| {
@@ -505,7 +573,9 @@ async fn list_users_handler(
   Ok(Json(AppResponse::Ok().with_data(json!({ "users": users }))))
 }
 
-/// POST /api/carehub/admin/users  body: { "email", "password" }
+/// POST /api/carehub/admin/users  body: { "email", "password", "name"?, "workspace_id"? }
+/// "name" (optional, up to 100 characters) is saved with the sign-in account as
+/// user_metadata.name, so it becomes the person's name at their first sign-in.
 async fn create_user_handler(
   user_uuid: UserUuid,
   body: Json<CreateUserBody>,
@@ -518,23 +588,25 @@ async fn create_user_handler(
     return Err(AppError::InvalidEmail("Please enter a valid email address".to_string()).into());
   }
   check_password(&body.password)?;
-  let user = gotrue_admin_call(
-    &state,
-    Method::POST,
-    "/admin/users",
-    Some(json!({
-      "email": email,
-      "password": body.password,
-      "email_confirm": true,
-    })),
-  )
-  .await?;
+  let name = clean_name(body.name.as_deref())?;
+  let mut new_account = json!({
+    "email": email,
+    "password": body.password,
+    "email_confirm": true,
+  });
+  if let Some(name) = &name {
+    new_account["user_metadata"] = json!({ "name": name });
+  }
+  let user = gotrue_admin_call(&state, Method::POST, "/admin/users", Some(new_account)).await?;
   if let Some(new_id) = user
     .get("id")
     .and_then(|v| v.as_str())
     .and_then(|v| Uuid::parse_str(v).ok())
   {
     require_password_change(&state.pg_pool, &new_id).await;
+    if let Some(name) = &name {
+      set_profile_name(&state.pg_pool, &new_id, name).await;
+    }
   }
   if let Some(workspace_id) = body.workspace_id {
     require_owner(&state, &user_uuid, &workspace_id).await?;
@@ -686,4 +758,42 @@ async fn delete_user_handler(
     tracing::warn!("carehub_admin: could not free email of removed account: {}", err);
   }
   Ok(Json(AppResponse::Ok()))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{clean_name, saved_name};
+  use serde_json::json;
+
+  fn clean(raw: &str) -> Option<String> {
+    clean_name(Some(raw)).ok().flatten()
+  }
+
+  #[test]
+  fn names_are_tidied() {
+    assert_eq!(clean_name(None).ok().flatten(), None);
+    assert_eq!(clean("  Jordan   Lee "), Some("Jordan Lee".to_string()));
+    assert_eq!(clean("Jordan\tLee\r\n"), Some("Jordan Lee".to_string()));
+    assert_eq!(clean("Jor\u{0}dan\u{7} Lee\u{1b}"), Some("Jordan Lee".to_string()));
+    assert_eq!(clean("\u{202E}Jordan Lee\u{2066}"), Some("Jordan Lee".to_string()));
+    assert_eq!(clean("José Núñez-O'Brien"), Some("José Núñez-O'Brien".to_string()));
+    assert_eq!(clean("   "), None);
+    assert_eq!(clean("\u{0}\u{1f}"), None);
+  }
+
+  #[test]
+  fn names_up_to_100_characters() {
+    assert_eq!(clean(&"é".repeat(100)).map(|n| n.chars().count()), Some(100));
+    assert!(clean_name(Some("a".repeat(101).as_str())).is_err());
+    assert_eq!(clean(&format!("  {}  ", "a".repeat(100))).map(|n| n.len()), Some(100));
+  }
+
+  #[test]
+  fn saved_name_from_the_sign_in_account() {
+    assert_eq!(saved_name(&json!({ "user_metadata": { "name": "  Jordan   Lee " } })), "Jordan Lee");
+    assert_eq!(saved_name(&json!({ "user_metadata": {} })), "");
+    assert_eq!(saved_name(&json!({ "id": "x" })), "");
+    assert_eq!(saved_name(&json!({ "user_metadata": { "name": 7 } })), "");
+    assert_eq!(saved_name(&json!({ "user_metadata": { "name": "a".repeat(101) } })), "");
+  }
 }

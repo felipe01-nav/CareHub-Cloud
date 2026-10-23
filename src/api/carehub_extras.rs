@@ -33,7 +33,7 @@ const AUTO_VERSION_GAP_MS: i64 = 4 * 60_000;
 const VIEW_DEDUPE_MS: i64 = 10 * 60_000;
 const MAX_AUTO_VERSIONS_PER_PAGE: i64 = 200;
 const SYSTEM_CHAT_NAME: &str = "🔔 Care Hub";
-const PERMS: [&str; 9] = [
+const PERMS: [&str; 12] = [
   "edit",
   "create",
   "comment",
@@ -42,6 +42,9 @@ const PERMS: [&str; 9] = [
   "templates",
   "analytics",
   "automations",
+  "learning_build",
+  "learning_assign",
+  "learning_analytics",
   "admin",
 ];
 

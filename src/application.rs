@@ -154,6 +154,8 @@ pub async fn run_actix_server(
       // CareHub: compatibility routes for the newer AppFlowy-Web client.
       // Registered first so their exact paths win over the workspace scope.
       .configure(crate::api::carehub_compat::configure)
+      // CareHub: Learning (courses, player, reports) – see carehub_learning.rs
+      .configure(crate::api::carehub_learning::configure)
       .service(server_info_scope())
       .service(user_scope())
       .service(workspace_scope())

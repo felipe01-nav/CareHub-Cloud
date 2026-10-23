@@ -9,6 +9,7 @@ pub mod carehub_extras;
 pub mod carehub_forms;
 pub mod carehub_google;
 pub mod carehub_icloud;
+pub mod carehub_learning;
 pub mod carehub_messages;
 pub mod chat;
 pub mod data_import;

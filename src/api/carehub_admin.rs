@@ -456,6 +456,16 @@ fn slim_user(user: &Value) -> Value {
   })
 }
 
+/// The name saved with the sign-in account when it was made (user_metadata.name),
+/// tidied like when it was saved. Empty when there is none.
+fn saved_name(user: &Value) -> String {
+  let raw = user
+    .get("user_metadata")
+    .and_then(|m| m.get("name"))
+    .and_then(|v| v.as_str());
+  clean_name(raw).ok().flatten().unwrap_or_default()
+}
+
 /// GET /api/carehub/admin/me -> { "is_admin": bool }
 async fn admin_me_handler(
   user_uuid: UserUuid,
@@ -472,6 +482,7 @@ async fn admin_me_handler(
 }
 
 /// GET /api/carehub/admin/users -> { "users": [...] }
+/// "name" is the profile name; before the first sign-in it is the name saved when the account was made.
 async fn list_users_handler(
   user_uuid: UserUuid,
   query: web::Query<WorkspaceQuery>,
@@ -493,7 +504,12 @@ async fn list_users_handler(
       .cloned()
       .unwrap_or_default();
     let count = batch.len();
-    users.extend(batch.iter().map(slim_user));
+    users.extend(batch.iter().map(|user| {
+      let mut slim = slim_user(user);
+      // Shown until the first sign-in; after that the profile name is used (below).
+      slim["name"] = json!(saved_name(user));
+      slim
+    }));
     if count < 100 {
       break;
     }
@@ -544,7 +560,9 @@ async fn list_users_handler(
     user["in_workspace"] = json!(in_workspace);
     user["joins_workspace"] = json!(!in_workspace && pending.contains(&email));
     let profile = id.and_then(|id| profiles.iter().find(|(uuid, _, _)| *uuid == id));
-    user["name"] = json!(profile.map(|(_, name, _)| name.trim().to_string()).unwrap_or_default());
+    if let Some((_, name, _)) = profile {
+      user["name"] = json!(name.trim());
+    }
     user["avatar"] = json!(profile.map(|(_, _, icon)| icon.clone()).unwrap_or_default());
   }
   users.sort_by(|a, b| {
@@ -744,7 +762,8 @@ async fn delete_user_handler(
 
 #[cfg(test)]
 mod tests {
-  use super::clean_name;
+  use super::{clean_name, saved_name};
+  use serde_json::json;
 
   fn clean(raw: &str) -> Option<String> {
     clean_name(Some(raw)).ok().flatten()
@@ -767,5 +786,14 @@ mod tests {
     assert_eq!(clean(&"é".repeat(100)).map(|n| n.chars().count()), Some(100));
     assert!(clean_name(Some("a".repeat(101).as_str())).is_err());
     assert_eq!(clean(&format!("  {}  ", "a".repeat(100))).map(|n| n.len()), Some(100));
+  }
+
+  #[test]
+  fn saved_name_from_the_sign_in_account() {
+    assert_eq!(saved_name(&json!({ "user_metadata": { "name": "  Jordan   Lee " } })), "Jordan Lee");
+    assert_eq!(saved_name(&json!({ "user_metadata": {} })), "");
+    assert_eq!(saved_name(&json!({ "id": "x" })), "");
+    assert_eq!(saved_name(&json!({ "user_metadata": { "name": 7 } })), "");
+    assert_eq!(saved_name(&json!({ "user_metadata": { "name": "a".repeat(101) } })), "");
   }
 }

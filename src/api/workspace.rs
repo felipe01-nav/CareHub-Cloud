@@ -1460,6 +1460,8 @@ async fn post_page_view_handler(
 ) -> Result<Json<AppResponse<Page>>> {
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
   let workspace_uuid = path.into_inner();
+  // CareHub roles: only people allowed to create pages may do so.
+  crate::api::carehub_extras::require_perm(&state.pg_pool, workspace_uuid, uid, "create").await?;
   let user = realtime_user_for_web_request(req.headers(), uid)?;
   let page = create_page(
     &state,
@@ -1473,6 +1475,17 @@ async fn post_page_view_handler(
     payload.collab_id,
   )
   .await?;
+  // CareHub automations: "When a page is created".
+  let created_view = serde_json::to_value(&page)
+    .ok()
+    .and_then(|v| v.get("view_id").and_then(|id| id.as_str()).and_then(|id| Uuid::parse_str(id).ok()));
+  crate::api::carehub_extras::on_page_created(
+    state.pg_pool.clone(),
+    workspace_uuid,
+    uid,
+    created_view,
+    payload.name.clone(),
+  );
   Ok(Json(AppResponse::Ok().with_data(page)))
 }
 

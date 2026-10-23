@@ -159,6 +159,10 @@ services:
       # Google Calendar sign-in (OAuth client from console.cloud.google.com).
       - CAREHUB_GOOGLE_CLIENT_ID=${CAREHUB_GOOGLE_CLIENT_ID:-}
       - CAREHUB_GOOGLE_CLIENT_SECRET=${CAREHUB_GOOGLE_CLIENT_SECRET:-}
+      # Lets Settings > Data & backups and the status page show the latest backups.
+      - CAREHUB_BACKUP_KEEP_DAYS=${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - ./backups:/carehub-backups:ro
     healthcheck:
       test: "curl --fail http://127.0.0.1:8000/health || exit 1"
       interval: 5s

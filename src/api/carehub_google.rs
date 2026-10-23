@@ -40,7 +40,9 @@ const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
 const API_BASE: &str = "https://www.googleapis.com/calendar/v3/";
 const CALENDARS_BASE: &str = "https://www.googleapis.com/calendar/v3/calendars/";
-const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
+// Events (view and edit) plus read-only calendar list: a gentler Google consent
+// screen than full calendar access ("delete all calendars").
+const SCOPE: &str = "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly";
 const CALLBACK_PATH: &str = "/api/carehub/calendar/google/callback";
 const STATE_TTL_MS: i64 = 15 * 60 * 1000;
 const MAX_CALENDARS: usize = 30;

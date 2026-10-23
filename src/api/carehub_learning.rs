@@ -2567,6 +2567,11 @@ async fn studio_delete(
 // ---------------------------------------------------------------------------
 
 fn url_ok(raw: &str) -> bool {
+  // S4: no control characters (U+0000-U+001F, U+007F) anywhere. Browsers drop
+  // tabs and line breaks, so "/<tab>/host" would open another website.
+  if raw.bytes().any(|b| b.is_ascii_control()) {
+    return false;
+  }
   let url = raw.trim();
   let lower = url.to_ascii_lowercase();
   // S4: "//host" and "/\host" are other websites to a browser, not Care Hub links.

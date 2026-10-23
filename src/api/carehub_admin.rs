@@ -42,6 +42,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/carehub/admin/users/{user_id}")
         .route(web::delete().to(delete_user_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/account/password-status")
+        .route(web::get().to(password_status_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/account/password")
+        .route(web::post().to(change_own_password_handler)),
     );
 }
 
@@ -178,6 +186,119 @@ fn check_password(password: &str) -> Result<(), AppError> {
     )));
   }
   Ok(())
+}
+
+/// The rules people see in the app: 8+ characters, upper and lower case, a symbol.
+fn check_strong_password(password: &str) -> Result<(), AppError> {
+  fn bad(msg: &str) -> Result<(), AppError> {
+    Err(AppError::InvalidPassword(msg.to_string()))
+  }
+  if password.chars().count() < 8 {
+    return bad("The password needs at least 8 characters.");
+  }
+  if !password.chars().any(|c| c.is_uppercase()) {
+    return bad("The password needs an uppercase letter.");
+  }
+  if !password.chars().any(|c| c.is_lowercase()) {
+    return bad("The password needs a lowercase letter.");
+  }
+  if !password
+    .chars()
+    .any(|c| !c.is_alphanumeric() && !c.is_whitespace())
+  {
+    return bad("The password needs a symbol (for example ! ? # or -).");
+  }
+  Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// "Choose a new password" at first sign-in
+//
+// Accounts made in Settings > User accounts, and accounts whose password the
+// administrator set, are listed in `carehub_password_change`. While listed, the
+// app asks the person to choose their own password before they can continue.
+// ---------------------------------------------------------------------------
+
+async fn ensure_password_change_table(pool: &sqlx::PgPool) -> Result<(), AppError> {
+  sqlx::query(
+    "CREATE TABLE IF NOT EXISTS carehub_password_change (\
+       user_id UUID PRIMARY KEY,\
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+  )
+  .execute(pool)
+  .await?;
+  Ok(())
+}
+
+async fn require_password_change(pool: &sqlx::PgPool, user_id: &Uuid) {
+  let result = async {
+    ensure_password_change_table(pool).await?;
+    sqlx::query(
+      "INSERT INTO carehub_password_change (user_id) VALUES ($1) \
+       ON CONFLICT (user_id) DO UPDATE SET created_at = NOW()",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok::<(), AppError>(())
+  }
+  .await;
+  if let Err(err) = result {
+    tracing::warn!("carehub_admin: could not mark password change: {}", err);
+  }
+}
+
+async fn clear_password_change(pool: &sqlx::PgPool, user_id: &Uuid) {
+  let result = async {
+    ensure_password_change_table(pool).await?;
+    sqlx::query("DELETE FROM carehub_password_change WHERE user_id = $1")
+      .bind(user_id)
+      .execute(pool)
+      .await?;
+    Ok::<(), AppError>(())
+  }
+  .await;
+  if let Err(err) = result {
+    tracing::warn!("carehub_admin: could not clear password change: {}", err);
+  }
+}
+
+/// GET /api/carehub/account/password-status -> { "must_change": bool }
+async fn password_status_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let me: Uuid = *user_uuid;
+  ensure_password_change_table(&state.pg_pool).await?;
+  let must_change: bool = sqlx::query_scalar(
+    "SELECT EXISTS (SELECT 1 FROM carehub_password_change WHERE user_id = $1)",
+  )
+  .bind(me)
+  .fetch_one(&state.pg_pool)
+  .await
+  .map_err(AppError::from)?;
+  Ok(Json(AppResponse::Ok().with_data(json!({ "must_change": must_change }))))
+}
+
+/// POST /api/carehub/account/password  body: { "password" }
+/// The signed-in person chooses their own new password.
+async fn change_own_password_handler(
+  user_uuid: UserUuid,
+  body: Json<SetPasswordBody>,
+  state: Data<AppState>,
+) -> ActixResult<Json<AppResponse<()>>> {
+  let me: Uuid = *user_uuid;
+  let body = body.into_inner();
+  check_strong_password(&body.password)?;
+  gotrue_admin_call(
+    &state,
+    Method::PUT,
+    &format!("/admin/users/{}", me),
+    Some(json!({ "password": body.password })),
+  )
+  .await?;
+  clear_password_change(&state.pg_pool, &me).await;
+  Ok(Json(AppResponse::Ok()))
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +529,13 @@ async fn create_user_handler(
     })),
   )
   .await?;
+  if let Some(new_id) = user
+    .get("id")
+    .and_then(|v| v.as_str())
+    .and_then(|v| Uuid::parse_str(v).ok())
+  {
+    require_password_change(&state.pg_pool, &new_id).await;
+  }
   if let Some(workspace_id) = body.workspace_id {
     require_owner(&state, &user_uuid, &workspace_id).await?;
     remember_join(&state, &email, &workspace_id).await?;
@@ -515,6 +643,13 @@ async fn set_password_handler(
     Some(json!({ "password": body.password })),
   )
   .await?;
+  // Someone else's password: they choose their own at the next sign-in.
+  let me: Uuid = *user_uuid;
+  if target == me {
+    clear_password_change(&state.pg_pool, &me).await;
+  } else {
+    require_password_change(&state.pg_pool, &target).await;
+  }
   Ok(Json(AppResponse::Ok()))
 }
 
@@ -538,6 +673,7 @@ async fn delete_user_handler(
     Some(json!({ "should_soft_delete": false })),
   )
   .await?;
+  clear_password_change(&state.pg_pool, &target).await;
   // Free the email so the same address can get a new account later.
   // The person's pages and their name on them are kept.
   if let Err(err) = sqlx::query(

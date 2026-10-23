@@ -13,6 +13,12 @@
 //! * Each person can only see and change their own connection.
 //! * The browser gets the same shapes as the iCloud routes (events as iCalendar
 //!   text), so the Calendar page shows both the same way.
+//!
+//! Without a Google OAuth client (for example a company Google account where
+//! the Google Cloud console is not available) the person can instead deploy a
+//! small Google Apps Script "bridge" in their own Google account and paste its
+//! Web app link + password here. The server then sends the same calendar
+//! requests through that script. The link and password are stored encrypted.
 
 use crate::biz::authentication::jwt::UserUuid;
 use crate::state::AppState;
@@ -65,7 +71,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     )
     .service(
       web::resource("/api/carehub/calendar/google/events/delete").route(web::post().to(delete_event_handler)),
-    );
+    )
+    .service(web::resource("/api/carehub/calendar/google/script").route(web::post().to(script_connect_handler)));
 }
 
 // ---------------------------------------------------------------------------
@@ -96,11 +103,16 @@ struct Settings {
   key: String,
 }
 
-fn settings() -> Option<Settings> {
+fn secret_key() -> Option<String> {
   let key = env("CAREHUB_SECRET_KEY")?;
   if key.len() < 32 {
     return None;
   }
+  Some(key)
+}
+
+fn settings() -> Option<Settings> {
+  let key = secret_key()?;
   Some(Settings {
     client_id: env("CAREHUB_GOOGLE_CLIENT_ID")?,
     client_secret: env("CAREHUB_GOOGLE_CLIENT_SECRET")?,
@@ -147,6 +159,15 @@ async fn ensure_tables(pool: &sqlx::PgPool) -> Result<(), AppError> {
        owner BIGINT NOT NULL,\
        origin TEXT NOT NULL,\
        created_ms BIGINT NOT NULL)",
+  )
+  .execute(pool)
+  .await?;
+  sqlx::query(
+    "CREATE TABLE IF NOT EXISTS carehub_google_script (\
+       owner BIGINT PRIMARY KEY,\
+       email TEXT NOT NULL DEFAULT '',\
+       secret BYTEA NOT NULL,\
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
   )
   .execute(pool)
   .await?;
@@ -353,7 +374,196 @@ fn checked_event_url(href: &str) -> Result<Url, AppError> {
   Ok(url)
 }
 
+// ---------------------------------------------------------------------------
+// Google Apps Script bridge (no Google Cloud console needed)
+// ---------------------------------------------------------------------------
+
+struct Script {
+  url: String,
+  key: String,
+  email: String,
+}
+
+/// Only Apps Script Web app links: https://script.google.com/(a/macros/domain|macros)/s/ID/exec
+fn clean_script_url(raw: &str) -> Option<String> {
+  let url = Url::parse(raw.trim()).ok()?;
+  if url.scheme() != "https" || url.host_str() != Some("script.google.com") {
+    return None;
+  }
+  if !url.username().is_empty() || url.password().is_some() || url.port().is_some() {
+    return None;
+  }
+  let path = url.path();
+  if !(path.starts_with("/macros/s/") || path.starts_with("/a/macros/"))
+    || !path.ends_with("/exec")
+    || path.contains("..")
+  {
+    return None;
+  }
+  Some(format!("https://script.google.com{}", path))
+}
+
+async fn load_script(state: &AppState, uid: i64) -> Result<Option<Script>, AppError> {
+  let key = match secret_key() {
+    Some(k) => k,
+    None => return Ok(None),
+  };
+  let row: Option<(String, String)> = sqlx::query_as(
+    "SELECT email, pgp_sym_decrypt(secret, $2) FROM carehub_google_script WHERE owner = $1",
+  )
+  .bind(uid)
+  .bind(&key)
+  .fetch_optional(&state.pg_pool)
+  .await
+  .map_err(|_| bad("Could not read the Google script connection. Please disconnect and connect again."))?;
+  Ok(row.and_then(|(email, secret)| {
+    let v: Value = serde_json::from_str(&secret).ok()?;
+    Some(Script {
+      url: v["url"].as_str()?.to_string(),
+      key: v["key"].as_str()?.to_string(),
+      email,
+    })
+  }))
+}
+
+/// Sends one request to the person's Apps Script and returns its `data`.
+async fn script_call(script: &Script, op: &str, body: Value) -> Result<Value, AppError> {
+  let mut body = if body.is_object() { body } else { json!({}) };
+  body["key"] = json!(script.key);
+  body["op"] = json!(op);
+  // Apps Script answers with a redirect to googleusercontent.com, which reqwest follows.
+  let http = reqwest::Client::builder()
+    .timeout(Duration::from_secs(90))
+    .user_agent("CareHub-Calendar/1.0")
+    .build()
+    .unwrap_or_else(|_| reqwest::Client::new());
+  let resp = http
+    .post(&script.url)
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| bad(&format!("The Google script could not be reached: {}", e)))?;
+  let status = resp.status().as_u16();
+  let text = resp.text().await.unwrap_or_default();
+  let value: Value = match serde_json::from_str(&text) {
+    Ok(v) => v,
+    Err(_) => {
+      if status == 404 {
+        return Err(bad(
+          "The Google script link was not found. Copy the whole Web app link (it ends with /exec).",
+        ));
+      }
+      return Err(bad(
+        "The Google script asked for a sign-in instead of answering. In Apps Script open Deploy > Manage deployments and set \"Who has access\" to \"Anyone\".",
+      ));
+    },
+  };
+  if let Some(err) = value["error"].as_str() {
+    let code = value["status"].as_u64().unwrap_or(400) as u16;
+    if code == 401 {
+      return Err(bad(
+        "The password doesn't match the one in the Google script (CAREHUB_KEY). Check both, then deploy again.",
+      ));
+    }
+    if err.contains("Calendar is not defined") {
+      return Err(bad(
+        "The Google script is missing the Google Calendar service. In Apps Script click Services (+), add Google Calendar API, then deploy a new version.",
+      ));
+    }
+    return Err(google_error(code, &json!({ "error": { "message": err } })));
+  }
+  Ok(value["data"].clone())
+}
+
+fn decode_segment(s: &str) -> String {
+  let bytes = s.as_bytes();
+  let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] == b'%' && i + 2 < bytes.len() && s.is_char_boundary(i + 1) && s.is_char_boundary(i + 3) {
+      if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+        out.push(b);
+        i += 3;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+  String::from_utf8_lossy(&out).to_string()
+}
+
+/// (calendar id, event id) from an event address made by `event_url`.
+fn event_ids(url: &Url) -> Result<(String, String), AppError> {
+  let segments: Vec<&str> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
+  if segments.len() != 6 {
+    return Err(bad("Unknown event"));
+  }
+  Ok((decode_segment(segments[3]), decode_segment(segments[5])))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScriptConnectBody {
+  url: String,
+  key: String,
+}
+
+/// POST /api/carehub/calendar/google/script { url, key } -> { connected, apple_id }
+async fn script_connect_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  body: Json<ScriptConnectBody>,
+) -> ActixResult<Json<AppResponse<Value>>> {
+  let uid = owner_uid(&state, &user_uuid).await?;
+  let secret = secret_key().ok_or_else(|| {
+    bad("Care Hub's secret key (CAREHUB_SECRET_KEY) is missing, so the connection can't be saved safely.")
+  })?;
+  let url = clean_script_url(&body.url).ok_or_else(|| {
+    bad("Please paste the Web app link from Apps Script. It starts with https://script.google.com/ and ends with /exec.")
+  })?;
+  let key = body.key.trim().to_string();
+  if key.chars().count() < 16 || key.chars().count() > 200 {
+    return Err(bad("The password needs at least 16 characters (the same one you put in the script).").into());
+  }
+  let mut script = Script { url, key, email: String::new() };
+  let pong = script_call(&script, "ping", json!({})).await?;
+  script.email = pong["email"].as_str().unwrap_or_default().to_string();
+  let stored = json!({ "url": script.url, "key": script.key }).to_string();
+  sqlx::query(
+    "INSERT INTO carehub_google_script (owner, email, secret) VALUES ($1, $2, pgp_sym_encrypt($3, $4)) \
+     ON CONFLICT (owner) DO UPDATE SET email = EXCLUDED.email, secret = EXCLUDED.secret, created_at = NOW()",
+  )
+  .bind(uid)
+  .bind(&script.email)
+  .bind(&stored)
+  .bind(&secret)
+  .execute(&state.pg_pool)
+  .await
+  .map_err(AppError::from)?;
+  Ok(Json(AppResponse::Ok().with_data(json!({ "connected": true, "apple_id": script.email }))))
+}
+
+fn push_event(events: &mut Vec<Value>, cal_id: &str, ev: &Value) {
+  let ics = match event_ics(ev) {
+    Some(ics) => ics,
+    None => return,
+  };
+  let id = ev["id"].as_str().unwrap_or_default();
+  if let Ok(href) = event_url(cal_id, id) {
+    events.push(json!({
+      "calendar": cal_id,
+      "href": href.as_str(),
+      "etag": ev["etag"].as_str().unwrap_or(""),
+      "ics": ics,
+    }));
+  }
+}
+
 async fn list_calendars(state: &AppState, uid: i64) -> Result<Vec<Value>, AppError> {
+  if let Some(script) = load_script(state, uid).await? {
+    let body = script_call(&script, "calendars", json!({})).await?;
+    return Ok(parse_calendar_list(&body));
+  }
   let mut url = Url::parse(API_BASE)
     .and_then(|u| u.join("users/me/calendarList"))
     .map_err(|_| bad("calendar url"))?;
@@ -362,6 +572,10 @@ async fn list_calendars(state: &AppState, uid: i64) -> Result<Vec<Value>, AppErr
   if !(200..300).contains(&status) {
     return Err(google_error(status, &body));
   }
+  Ok(parse_calendar_list(&body))
+}
+
+fn parse_calendar_list(body: &Value) -> Vec<Value> {
   let mut out = Vec::new();
   for item in body["items"].as_array().cloned().unwrap_or_default() {
     let id = item["id"].as_str().unwrap_or_default().to_string();
@@ -390,7 +604,7 @@ async fn list_calendars(state: &AppState, uid: i64) -> Result<Vec<Value>, AppErr
   }
   // The main calendar first.
   out.sort_by_key(|c| !c["primary"].as_bool().unwrap_or(false));
-  Ok(out)
+  out
 }
 
 // ---------------------------------------------------------------------------
@@ -515,13 +729,45 @@ fn event_ics(ev: &Value) -> Option<String> {
 /// GET /api/carehub/calendar/google -> { enabled, connected, apple_id (email), calendars, error? }
 async fn status_handler(user_uuid: UserUuid, state: Data<AppState>) -> ActixResult<Json<AppResponse<Value>>> {
   let uid = owner_uid(&state, &user_uuid).await?;
+  let script_ok = secret_key().is_some();
+  let oauth = settings().is_some();
+  match load_script(&state, uid).await {
+    Ok(Some(script)) => {
+      let answer = match list_calendars(&state, uid).await {
+        Ok(calendars) => json!({
+          "enabled": true, "oauth": oauth, "script": true, "mode": "script", "connected": true,
+          "apple_id": script.email, "calendars": calendars,
+        }),
+        Err(e) => json!({
+          "enabled": true, "oauth": oauth, "script": true, "mode": "script", "connected": true,
+          "apple_id": script.email, "calendars": [], "error": e.to_string(),
+        }),
+      };
+      return Ok(Json(AppResponse::Ok().with_data(answer)));
+    },
+    Ok(None) => {},
+    Err(e) => {
+      return Ok(Json(AppResponse::Ok().with_data(json!({
+        "enabled": true, "oauth": oauth, "script": true, "mode": "script", "connected": true,
+        "apple_id": "", "calendars": [], "error": e.to_string(),
+      }))))
+    },
+  }
   let s = match settings() {
     Some(s) => s,
-    None => return Ok(Json(AppResponse::Ok().with_data(json!({ "enabled": false, "connected": false })))),
+    None => {
+      return Ok(Json(AppResponse::Ok().with_data(
+        json!({ "enabled": script_ok, "oauth": false, "script": script_ok, "connected": false }),
+      )))
+    },
   };
   let email = match load_refresh_token(&state, uid, &s.key).await {
     Ok(Some((email, _))) => email,
-    Ok(None) => return Ok(Json(AppResponse::Ok().with_data(json!({ "enabled": true, "connected": false })))),
+    Ok(None) => {
+      return Ok(Json(AppResponse::Ok().with_data(
+        json!({ "enabled": true, "oauth": true, "script": script_ok, "connected": false }),
+      )))
+    },
     Err(e) => {
       return Ok(Json(AppResponse::Ok().with_data(json!({
         "enabled": true, "connected": true, "apple_id": "", "calendars": [], "error": e.to_string(),
@@ -725,6 +971,11 @@ async fn disconnect_handler(user_uuid: UserUuid, state: Data<AppState>) -> Actix
     .execute(&state.pg_pool)
     .await
     .map_err(AppError::from)?;
+  sqlx::query("DELETE FROM carehub_google_script WHERE owner = $1")
+    .bind(uid)
+    .execute(&state.pg_pool)
+    .await
+    .map_err(AppError::from)?;
   if let Ok(mut cache) = token_cache().lock() {
     cache.remove(&uid);
   }
@@ -762,6 +1013,38 @@ async fn list_events_handler(
   let calendars = list_calendars(&state, uid).await?;
   let mut events = Vec::new();
   let mut errors = Vec::new();
+  if let Some(script) = load_script(&state, uid).await? {
+    let ids: Vec<String> = calendars
+      .iter()
+      .filter_map(|c| c["url"].as_str().map(|s| s.to_string()))
+      .collect();
+    let data = script_call(
+      &script,
+      "events_all",
+      json!({
+        "calendars": ids,
+        "params": {
+          "timeMin": time_min, "timeMax": time_max, "singleEvents": true,
+          "maxResults": 2500, "showDeleted": false,
+        },
+      }),
+    )
+    .await?;
+    'script_calendars: for one in data["results"].as_array().cloned().unwrap_or_default() {
+      let cal_id = one["calendar"].as_str().unwrap_or_default().to_string();
+      if let Some(err) = one["error"].as_str() {
+        errors.push(json!({ "calendar": cal_id, "error": err }));
+        continue;
+      }
+      for ev in one["items"].as_array().cloned().unwrap_or_default() {
+        push_event(&mut events, &cal_id, &ev);
+        if events.len() >= MAX_EVENTS {
+          break 'script_calendars;
+        }
+      }
+    }
+    return Ok(Json(AppResponse::Ok().with_data(json!({ "events": events, "errors": errors }))));
+  }
   'calendars: for cal in calendars {
     let cal_id = cal["url"].as_str().unwrap_or_default().to_string();
     let mut page_token = String::new();
@@ -891,6 +1174,16 @@ async fn create_event_handler(
     return Err(bad("Please choose a Google calendar").into());
   }
   let event = google_event(&body)?;
+  if let Some(script) = load_script(&state, uid).await? {
+    let created = script_call(&script, "insert", json!({ "calendar": body.calendar.trim(), "event": event })).await?;
+    let id = created["id"].as_str().unwrap_or_default();
+    let href = event_url(body.calendar.trim(), id)?;
+    return Ok(Json(AppResponse::Ok().with_data(json!({
+      "href": href.as_str(),
+      "etag": created["etag"].as_str().unwrap_or(""),
+      "uid": id,
+    }))));
+  }
   let url = calendar_events_url(body.calendar.trim())?;
   let (status, created) = google(&state, uid, reqwest::Method::POST, url, Some(event), "").await?;
   if !(200..300).contains(&status) {
@@ -914,6 +1207,14 @@ async fn update_event_handler(
   let uid = owner_uid(&state, &user_uuid).await?;
   let url = checked_event_url(&body.href)?;
   let event = google_event(&body)?;
+  if let Some(script) = load_script(&state, uid).await? {
+    let (calendar, id) = event_ids(&url)?;
+    let updated = script_call(&script, "patch", json!({ "calendar": calendar, "id": id, "event": event })).await?;
+    return Ok(Json(AppResponse::Ok().with_data(json!({
+      "href": url.as_str(),
+      "etag": updated["etag"].as_str().unwrap_or(""),
+    }))));
+  }
   let (status, updated) = google(&state, uid, reqwest::Method::PATCH, url.clone(), Some(event), &body.etag).await?;
   if !(200..300).contains(&status) {
     return Err(google_error(status, &updated).into());
@@ -939,6 +1240,11 @@ async fn delete_event_handler(
 ) -> ActixResult<Json<AppResponse<Value>>> {
   let uid = owner_uid(&state, &user_uuid).await?;
   let url = checked_event_url(&body.href)?;
+  if let Some(script) = load_script(&state, uid).await? {
+    let (calendar, id) = event_ids(&url)?;
+    script_call(&script, "remove", json!({ "calendar": calendar, "id": id })).await?;
+    return Ok(Json(AppResponse::Ok().with_data(json!({ "deleted": true }))));
+  }
   let (status, resp) = google(&state, uid, reqwest::Method::DELETE, url, None, &body.etag).await?;
   if !(200..300).contains(&status) && status != 404 && status != 410 {
     return Err(google_error(status, &resp).into());

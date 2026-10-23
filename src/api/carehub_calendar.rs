@@ -96,7 +96,7 @@ fn clip(s: &str, max: usize) -> String {
   s.chars().take(max).collect()
 }
 
-async fn ensure_tables(pool: &sqlx::PgPool) -> Result<(), AppError> {
+pub(crate) async fn ensure_tables(pool: &sqlx::PgPool) -> Result<(), AppError> {
   if TABLES_READY.load(Ordering::Relaxed) {
     return Ok(());
   }

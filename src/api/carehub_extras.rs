@@ -202,7 +202,7 @@ pub(crate) async fn ensure_tables(pool: &PgPool) -> Result<(), AppError> {
   Ok(())
 }
 
-async fn get_setting(pool: &PgPool, ws: Uuid, key: &str) -> Result<Value, AppError> {
+pub(crate) async fn get_setting(pool: &PgPool, ws: Uuid, key: &str) -> Result<Value, AppError> {
   let raw: Option<String> =
     sqlx::query_scalar("SELECT value FROM carehub_setting WHERE workspace_id = $1 AND key = $2")
       .bind(ws)
@@ -273,7 +273,7 @@ fn clean_perms(v: Option<&Value>) -> Vec<String> {
   out
 }
 
-fn roles_list(cfg: &Value) -> Vec<Value> {
+pub(crate) fn roles_list(cfg: &Value) -> Vec<Value> {
   let mut list = preset_roles();
   if let Some(custom) = cfg.get("custom").and_then(|v| v.as_array()) {
     for r in custom.iter().take(30) {
@@ -293,7 +293,7 @@ fn roles_list(cfg: &Value) -> Vec<Value> {
   list
 }
 
-fn role_info(list: &[Value], id: &str) -> Option<(String, String, Vec<String>)> {
+pub(crate) fn role_info(list: &[Value], id: &str) -> Option<(String, String, Vec<String>)> {
   list.iter().find(|r| str_of(r, "id") == id).map(|r| {
     (
       id.to_string(),
@@ -305,7 +305,7 @@ fn role_info(list: &[Value], id: &str) -> Option<(String, String, Vec<String>)> 
 
 /// Which role someone has: CAREHUB_ADMIN_EMAILS are always admins, guests are
 /// always viewers, then the assignment, then owner = admin, then the default.
-fn resolve_role_id(cfg: &Value, email: &str, af_role: i32) -> String {
+pub(crate) fn resolve_role_id(cfg: &Value, email: &str, af_role: i32) -> String {
   let owner: i32 = AFRole::Owner.into();
   let guest: i32 = AFRole::Guest.into();
   if !email.is_empty() && admin_emails().iter().any(|e| e == email) {
@@ -1342,7 +1342,7 @@ async fn system_post(pool: &PgPool, chat: Uuid, body: &str) -> Result<(), AppErr
 }
 
 /// The person's own "🔔 Care Hub" chat, created the first time it is needed.
-async fn notify_user(pool: &PgPool, uid: i64, body: &str) -> Result<(), AppError> {
+pub(crate) async fn notify_user(pool: &PgPool, uid: i64, body: &str) -> Result<(), AppError> {
   super::carehub_messages::ensure_tables(pool).await?;
   let found: Option<Uuid> = sqlx::query_scalar(
     "SELECT c.id FROM carehub_chat c JOIN carehub_chat_member m ON m.chat_id = c.id AND m.uid = $1 \

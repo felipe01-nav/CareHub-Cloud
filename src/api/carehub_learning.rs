@@ -113,7 +113,7 @@ const TABLES: &[&str] = &[
 
 /// Creates the learning tables once. A failure is logged and turned into a
 /// friendly message; it never stops the server.
-async fn ready(pool: &PgPool) -> Result<(), AppError> {
+pub(crate) async fn ready(pool: &PgPool) -> Result<(), AppError> {
   if READY.load(Ordering::Relaxed) {
     return Ok(());
   }
@@ -244,17 +244,17 @@ fn uid_of(v: Option<&Value>) -> Option<i64> {
 }
 
 /// Who is calling, in which workspace.
-struct Ctx {
-  ws: Uuid,
+pub(crate) struct Ctx {
+  pub(crate) ws: Uuid,
   me: Me,
 }
 
 impl Ctx {
-  fn uid(&self) -> i64 {
+  pub(crate) fn uid(&self) -> i64 {
     self.me.uid
   }
 
-  fn has(&self, perm: &str) -> bool {
+  pub(crate) fn has(&self, perm: &str) -> bool {
     self.me.perms.iter().any(|p| p == perm || p == "admin")
   }
 
@@ -276,7 +276,7 @@ impl Ctx {
 }
 
 /// Signed-in, non-guest member of the workspace, with the tables ready.
-async fn ctx(state: &AppState, user: &UserUuid, ws: &str) -> Result<Ctx, AppError> {
+pub(crate) async fn ctx(state: &AppState, user: &UserUuid, ws: &str) -> Result<Ctx, AppError> {
   let ws = parse_uuid(ws, WS_LINK_MSG)?;
   let uid = state.user_cache.get_user_uid(user).await?;
   let me = me_in(&state.pg_pool, ws, uid).await.map_err(|err| match err {
@@ -411,7 +411,7 @@ fn shuffle<T>(items: &mut [T], seed: &str) {
   }
 }
 
-fn pair_token(course: Uuid, uid: i64, pair_id: &str) -> String {
+pub(crate) fn pair_token(course: Uuid, uid: i64, pair_id: &str) -> String {
   let h = mix(fnv(&format!("{}:{}:{}", course, uid, pair_id)));
   format!("{:016x}", h).chars().take(12).collect()
 }
@@ -1071,7 +1071,7 @@ fn completion_block(st: &Settings, lessons: &[Value], prog: &Prog, idx: usize) -
 // Learner endpoints
 // ---------------------------------------------------------------------------
 
-type CardRow = (
+pub(crate) type CardRow = (
   Uuid,
   String,
   i64,
@@ -1086,7 +1086,7 @@ type CardRow = (
   bool,
 );
 
-type MyRow = (
+pub(crate) type MyRow = (
   Uuid,
   String,
   i32,
@@ -1117,7 +1117,7 @@ fn my_row_json(r: &MyRow) -> Value {
   })
 }
 
-fn card_json(r: &CardRow, my: Option<&MyRow>) -> Value {
+pub(crate) fn card_json(r: &CardRow, my: Option<&MyRow>) -> Value {
   json!({
     "id": r.0.to_string(),
     "title": r.4,

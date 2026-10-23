@@ -298,6 +298,9 @@ fn kind_of(q: &Value) -> &'static str {
     "multiple" => "multiple",
     "true_false" => "true_false",
     "matching" => "matching",
+    "fill_blank" => "fill_blank",
+    "ordering" => "ordering",
+    "hotspot" => "hotspot",
     _ => "single",
   }
 }
@@ -2066,23 +2069,9 @@ fn question_stats(q: &Value, course: Uuid, attempts: &[(i64, Value, Value)]) -> 
         Some(o) => o,
         None => continue,
       };
-      let by_token: HashMap<String, &str> = pairs
-        .iter()
-        .map(|p| {
-          (
-            carehub_learning::pair_token(course, *uid, txt(p, "id")),
-            txt(p, "right").trim(),
-          )
-        })
-        .collect();
-      for (i, p) in pairs.iter().enumerate() {
-        let want = txt(p, "right").trim();
-        let hit = chosen
-          .get(txt(p, "id"))
-          .and_then(|t| t.as_str())
-          .and_then(|t| by_token.get(t))
-          .map(|got| *got == want)
-          .unwrap_or(false);
+      // S2: read by text (today's tokens, or the old per-person ones).
+      let hits = carehub_learning::matching_hits(q, course, *uid, chosen);
+      for (i, hit) in hits.into_iter().enumerate() {
         if hit {
           if let Some(n) = picked.get_mut(i) {
             *n += 1;
@@ -2106,7 +2095,9 @@ fn question_stats(q: &Value, course: Uuid, attempts: &[(i64, Value, Value)]) -> 
       }
     }
   }
-  let rows: Vec<Value> = if kind == "matching" {
+  let rows: Vec<Value> = if let Some(rows) = carehub_learning::insight_rows(q, attempts) {
+    rows
+  } else if kind == "matching" {
     pairs
       .iter()
       .enumerate()

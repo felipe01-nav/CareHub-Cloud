@@ -29,6 +29,8 @@ const MAX_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 const STUDIO_BODY_BYTES: usize = 8 * 1024 * 1024;
 const PLAYER_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENTS: usize = 200;
+/// S3: progress() stops storing events for a person and course past this.
+const MAX_STORED_EVENTS: i64 = 5_000;
 const HEARTBEAT_CAP_MS: i64 = 60_000;
 const QUIZ_LESSON: &str = "_quiz";
 const MAX_TITLE_CHARS: usize = 200;
@@ -375,6 +377,9 @@ fn kind_of(q: &Value) -> &'static str {
     "multiple" => "multiple",
     "true_false" => "true_false",
     "matching" => "matching",
+    "fill_blank" => "fill_blank",
+    "ordering" => "ordering",
+    "hotspot" => "hotspot",
     _ => "single",
   }
 }
@@ -411,9 +416,338 @@ fn shuffle<T>(items: &mut [T], seed: &str) {
   }
 }
 
-pub(crate) fn pair_token(course: Uuid, uid: i64, pair_id: &str) -> String {
+/// Matching tokens from before S2 (person + pair id). Only used to read quiz
+/// attempts stored before that change (insights); answers now use text tokens.
+fn old_pair_token(course: Uuid, uid: i64, pair_id: &str) -> String {
   let h = mix(fnv(&format!("{}:{}:{}", course, uid, pair_id)));
   format!("{:016x}", h).chars().take(12).collect()
+}
+
+// Fill in the blank, put in order and click the right spot (wave 3 kinds).
+
+const MAX_BLANK_ANSWER_CHARS: usize = 200;
+const MAX_ACCEPTED_CHARS: usize = 80;
+const SPOT_MIN_SIZE: f64 = 2.0;
+const SPOT_SLACK: f64 = 0.000_001;
+
+/// Whitespace exactly as browsers see it in `trim()` and `/\s/`, so blanks
+/// are matched the same way here and in the web app.
+fn js_space(c: char) -> bool {
+  (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+fn js_trim(text: &str) -> &str {
+  text.trim_matches(js_space)
+}
+
+/// Fill-in-the-blank match form: trim, collapse whitespace runs to one space,
+/// drop one trailing ".", then lowercase unless capitals must match.
+fn normalise_blank(raw: &str, case_sensitive: bool) -> String {
+  let mut out = String::with_capacity(raw.len());
+  let mut gap = false;
+  for ch in js_trim(raw).chars() {
+    if js_space(ch) {
+      gap = true;
+      continue;
+    }
+    if gap {
+      out.push(' ');
+      gap = false;
+    }
+    out.push(ch);
+  }
+  if out.ends_with('.') {
+    out.pop();
+  }
+  if case_sensitive {
+    out
+  } else {
+    out.to_lowercase()
+  }
+}
+
+/// A fill-in-the-blank question's accepted answers (trimmed, blanks skipped).
+fn blank_answers(q: &Value) -> Vec<&str> {
+  list(q, "answers")
+    .iter()
+    .filter_map(|a| a.as_str())
+    .map(js_trim)
+    .filter(|a| !normalise_blank(a, true).is_empty())
+    .collect()
+}
+
+fn blank_correct(q: &Value, answer: &Value) -> bool {
+  let given = match answer.as_str() {
+    Some(s) if s.chars().count() <= MAX_BLANK_ANSWER_CHARS => s,
+    _ => return false,
+  };
+  let case_sensitive = flag(q, "case_sensitive", false);
+  let got = normalise_blank(given, case_sensitive);
+  !got.is_empty()
+    && blank_answers(q)
+      .iter()
+      .any(|a| normalise_blank(a, case_sensitive) == got)
+}
+
+// S2: answer tokens for matching right sides and put-in-order items come only
+// from the text, so neither a token nor the order it's shown in gives the right
+// answer away.
+
+/// The first 12 hex of mix(fnv("<course>:<text>")), plus "~2", "~3"... when the
+/// same text comes up again in the question, so tokens stay unique. Never built
+/// from ids, the person or the author's order.
+fn text_tokens(course: Uuid, texts: &[&str]) -> Vec<String> {
+  let mut seen: HashMap<&str, usize> = HashMap::new();
+  texts
+    .iter()
+    .map(|text| {
+      let n = seen.entry(*text).or_insert(0);
+      *n += 1;
+      let base: String = format!("{:016x}", mix(fnv(&format!("{}:{}", course, text))))
+        .chars()
+        .take(12)
+        .collect();
+      if *n > 1 {
+        format!("{}~{}", base, n)
+      } else {
+        base
+      }
+    })
+    .collect()
+}
+
+/// Each token back to its text (tokens are recomputed from the question).
+fn text_by_token<'a>(course: Uuid, texts: &[&'a str]) -> HashMap<String, &'a str> {
+  text_tokens(course, texts)
+    .into_iter()
+    .zip(texts.iter().copied())
+    .collect()
+}
+
+/// A matching question's right sides (trimmed), in the author's order.
+fn right_texts(q: &Value) -> Vec<&str> {
+  list(q, "pairs")
+    .iter()
+    .map(|p| txt(p, "right").trim())
+    .collect()
+}
+
+/// A put-in-order question's item texts (trimmed), in the right order.
+fn item_texts(q: &Value) -> Vec<&str> {
+  list(q, "items")
+    .iter()
+    .map(|it| txt(it, "text").trim())
+    .collect()
+}
+
+/// Put-in-order items as learners get them: text tokens in a fresh random
+/// order on every request (S2: no per-person seed a browser could undo), and
+/// never already in the right order unless every item reads the same.
+fn shuffled_items(q: &Value, course: Uuid) -> Vec<Value> {
+  let items = list(q, "items");
+  let texts = item_texts(q);
+  let tokens = text_tokens(course, &texts);
+  let mut idx: Vec<usize> = (0..items.len()).collect();
+  shuffle(&mut idx, &Uuid::new_v4().to_string());
+  let reads_right = idx
+    .iter()
+    .enumerate()
+    .all(|(pos, i)| texts.get(*i) == texts.get(pos));
+  if reads_right && idx.len() > 1 {
+    idx.rotate_left(1);
+  }
+  idx
+    .iter()
+    .filter_map(|i| match (tokens.get(*i), items.get(*i)) {
+      (Some(token), Some(it)) => Some(json!({ "token": token, "text": txt(it, "text") })),
+      _ => None,
+    })
+    .collect()
+}
+
+/// Every token used once, and the texts read in the right order (items with
+/// the same text are interchangeable, like matching's right sides).
+fn ordering_correct(q: &Value, answer: &Value, course: Uuid) -> bool {
+  let texts = item_texts(q);
+  let got = match answer.as_array() {
+    Some(a) => a,
+    None => return false,
+  };
+  if texts.is_empty() || got.len() != texts.len() {
+    return false;
+  }
+  let by_token: HashMap<String, usize> = text_tokens(course, &texts)
+    .into_iter()
+    .enumerate()
+    .map(|(i, token)| (token, i))
+    .collect();
+  let mut used: HashSet<usize> = HashSet::new();
+  got
+    .iter()
+    .enumerate()
+    .all(|(pos, t)| match t.as_str().and_then(|t| by_token.get(t)) {
+      Some(i) => used.insert(*i) && texts.get(*i) == texts.get(pos),
+      None => false,
+    })
+}
+
+fn coord(v: &Value, key: &str) -> Option<f64> {
+  v.get(key)
+    .and_then(|x| x.as_f64())
+    .filter(|x| x.is_finite())
+}
+
+/// A right spot as (x, y, w, h), in percent of the picture.
+fn spot_of(s: &Value) -> Option<(f64, f64, f64, f64)> {
+  Some((coord(s, "x")?, coord(s, "y")?, coord(s, "w")?, coord(s, "h")?))
+}
+
+fn spot_inside(s: &Value) -> bool {
+  match spot_of(s) {
+    Some((x, y, w, h)) => {
+      x >= -SPOT_SLACK
+        && y >= -SPOT_SLACK
+        && w >= SPOT_MIN_SIZE - SPOT_SLACK
+        && h >= SPOT_MIN_SIZE - SPOT_SLACK
+        && x + w <= 100.0 + SPOT_SLACK
+        && y + h <= 100.0 + SPOT_SLACK
+    },
+    None => false,
+  }
+}
+
+/// The click `{x, y}` (percent) is inside a right spot; edges count.
+fn hotspot_hit(q: &Value, answer: &Value) -> bool {
+  let (x, y) = match (coord(answer, "x"), coord(answer, "y")) {
+    (Some(x), Some(y)) => (x, y),
+    _ => return false,
+  };
+  if !(0.0..=100.0).contains(&x) || !(0.0..=100.0).contains(&y) {
+    return false;
+  }
+  list(q, "spots")
+    .iter()
+    .filter_map(spot_of)
+    .any(|(sx, sy, sw, sh)| x >= sx && x <= sx + sw && y >= sy && y <= sy + sh)
+}
+
+/// The hotspot picture as learners get it (never the right spots).
+fn public_image(q: &Value) -> Value {
+  let none = Value::Null;
+  let image = q.get("image").unwrap_or(&none);
+  json!({ "url": txt(image, "url"), "alt": txt(image, "alt") })
+}
+
+/// Insights: for each pair of a matching question, whether a stored answer
+/// picked its right side. Reads today's text tokens (S2) and, for attempts
+/// stored before S2, the old per-person tokens.
+pub(crate) fn matching_hits(
+  q: &Value,
+  course: Uuid,
+  uid: i64,
+  chosen: &Map<String, Value>,
+) -> Vec<bool> {
+  let pairs = list(q, "pairs");
+  let texts = right_texts(q);
+  let mut by_token: HashMap<String, &str> = pairs
+    .iter()
+    .zip(texts.iter())
+    .map(|(p, text)| (old_pair_token(course, uid, txt(p, "id")), *text))
+    .collect();
+  by_token.extend(text_by_token(course, &texts));
+  pairs
+    .iter()
+    .zip(texts.iter())
+    .map(|(p, want)| {
+      chosen
+        .get(txt(p, "id"))
+        .and_then(|t| t.as_str())
+        .and_then(|t| by_token.get(t))
+        .map(|got| got == want)
+        .unwrap_or(false)
+    })
+    .collect()
+}
+
+const MAX_BLANK_ROWS: usize = 10;
+
+/// Insights rows (`questions[].answers`) for fill in the blank, put in order
+/// and click the right spot; None for the other kinds. `attempts` holds
+/// (uid, answers, results) of the quiz attempts on the live version.
+pub(crate) fn insight_rows(q: &Value, attempts: &[(i64, Value, Value)]) -> Option<Vec<Value>> {
+  let kind = kind_of(q);
+  if !matches!(kind, "fill_blank" | "ordering" | "hotspot") {
+    return None;
+  }
+  let qid = txt(q, "id");
+  let case_sensitive = flag(q, "case_sensitive", false);
+  let mut asked: i64 = 0;
+  let mut right: i64 = 0;
+  let mut other: i64 = 0;
+  let mut counts: HashMap<String, i64> = HashMap::new();
+  for (_, answers, results) in attempts {
+    let result = match results
+      .as_array()
+      .and_then(|r| r.iter().find(|x| txt(x, "question_id") == qid))
+    {
+      Some(r) => r,
+      None => continue,
+    };
+    asked += 1;
+    if flag(result, "correct", false) {
+      right += 1;
+    }
+    if kind != "fill_blank" {
+      continue;
+    }
+    match answers.get(qid).and_then(|a| a.as_str()) {
+      Some(given) if given.chars().count() > MAX_BLANK_ANSWER_CHARS => other += 1,
+      Some(given) => {
+        let text = normalise_blank(given, case_sensitive);
+        if !text.is_empty() {
+          *counts.entry(text).or_insert(0) += 1;
+        }
+      },
+      None => {},
+    }
+  }
+  let rows = match kind {
+    "ordering" => vec![
+      json!({ "id": "right", "text": "Right order", "correct": true, "picked": right }),
+      json!({ "id": "wrong", "text": "Wrong order", "correct": false, "picked": asked - right }),
+    ],
+    "hotspot" => vec![
+      json!({ "id": "hit", "text": "Clicked a right spot", "correct": true, "picked": right }),
+      json!({ "id": "miss", "text": "Missed", "correct": false, "picked": asked - right }),
+    ],
+    _ => {
+      let accepted: HashSet<String> = blank_answers(q)
+        .iter()
+        .map(|a| normalise_blank(a, case_sensitive))
+        .collect();
+      let mut common: Vec<(String, i64)> = counts.into_iter().collect();
+      common.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+      let mut rows: Vec<Value> = Vec::new();
+      for (i, (text, picked)) in common.into_iter().enumerate() {
+        if i < MAX_BLANK_ROWS {
+          let correct = accepted.contains(&text);
+          rows.push(json!({
+            "id": format!("a{}", i + 1),
+            "text": text,
+            "correct": correct,
+            "picked": picked,
+          }));
+        } else {
+          other += picked;
+        }
+      }
+      if other > 0 {
+        rows.push(json!({ "id": "other", "text": "Other answers", "correct": false, "picked": other }));
+      }
+      rows
+    },
+  };
+  Some(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +1039,58 @@ async fn log_event(
   Ok(())
 }
 
+/// S3: events stored for this person and course, counted up to the cap.
+async fn events_stored(conn: &mut PgConnection, course: Uuid, uid: i64) -> Result<i64, AppError> {
+  let (n,): (i64,) = sqlx::query_as(
+    "SELECT COUNT(*) FROM (SELECT 1 FROM carehub_learning_event \
+       WHERE course_id = $1 AND uid = $2 LIMIT $3) AS capped",
+  )
+  .bind(course)
+  .bind(uid)
+  .bind(MAX_STORED_EVENTS)
+  .fetch_one(&mut *conn)
+  .await?;
+  Ok(n)
+}
+
+/// S3: the same event (kind, lesson, block and data, its time aside) is
+/// already stored for this person and course.
+async fn event_seen(
+  conn: &mut PgConnection,
+  course: Uuid,
+  uid: i64,
+  ev: &Ev,
+) -> Result<bool, AppError> {
+  let (seen,): (bool,) = sqlx::query_as(
+    "SELECT EXISTS (SELECT 1 FROM carehub_learning_event \
+       WHERE course_id = $1 AND uid = $2 AND kind = $3 AND lesson_id = $4 AND block_id = $5 \
+         AND (CASE WHEN jsonb_typeof(data) = 'object' THEN data - 'ms' ELSE data END) \
+           IS NOT DISTINCT FROM $6::jsonb)",
+  )
+  .bind(course)
+  .bind(uid)
+  .bind(ev.kind.as_str())
+  .bind(ev.lesson_id.as_str())
+  .bind(ev.block_id.as_str())
+  .bind(without_time(ev.data.as_deref()))
+  .fetch_one(&mut *conn)
+  .await?;
+  Ok(seen)
+}
+
+/// Event data without its own time ("ms", the knowledge-check answer time), so
+/// repeats can be spotted (S3).
+fn without_time(data: Option<&str>) -> Option<String> {
+  let raw = data?;
+  match serde_json::from_str::<Value>(raw) {
+    Ok(Value::Object(mut m)) => {
+      m.remove("ms");
+      Some(Value::Object(m).to_string())
+    },
+    _ => Some(raw.to_string()),
+  }
+}
+
 struct Head {
   status: String,
   published_version: Option<i32>,
@@ -916,32 +1302,49 @@ fn pick_questions<'a>(
   idx.iter().filter_map(|i| all.get(*i)).collect()
 }
 
-fn shuffled_rights(q: &Value, course: Uuid, uid: i64) -> Vec<Value> {
-  let mut rights: Vec<Value> = list(q, "pairs")
-    .iter()
-    .map(|p| json!({ "token": pair_token(course, uid, txt(p, "id")), "text": txt(p, "right") }))
+/// A matching question's right sides as learners get them: text tokens, sorted
+/// A-Z by text (S2: no shuffle a browser could undo).
+fn sorted_rights(q: &Value, course: Uuid) -> Vec<Value> {
+  let pairs = list(q, "pairs");
+  let texts = right_texts(q);
+  let mut rights: Vec<(String, &str, String, &str)> = text_tokens(course, &texts)
+    .into_iter()
+    .zip(texts.iter().zip(pairs.iter()))
+    .map(|(token, (text, p))| (text.to_lowercase(), *text, token, txt(p, "right")))
     .collect();
-  shuffle(&mut rights, &format!("{}:{}:{}:rights", course, uid, txt(q, "id")));
+  rights.sort();
   rights
+    .into_iter()
+    .map(|(_, _, token, shown)| json!({ "token": token, "text": shown }))
+    .collect()
 }
 
 /// A final-quiz question without answers, feedback or explanations.
-fn public_question(q: &Value, course: Uuid, uid: i64) -> Value {
+fn public_question(q: &Value, course: Uuid) -> Value {
   let kind = kind_of(q);
-  let options: Vec<Value> = list(q, "options")
-    .iter()
-    .map(|o| json!({ "id": txt(o, "id"), "text": txt(o, "text") }))
-    .collect();
-  let pairs: Vec<Value> = list(q, "pairs")
-    .iter()
-    .map(|p| json!({ "id": txt(p, "id"), "left": txt(p, "left") }))
-    .collect();
-  let rights: Vec<Value> = if kind == "matching" {
-    shuffled_rights(q, course, uid)
+  let classic = matches!(kind, "single" | "multiple" | "true_false" | "matching");
+  let options: Vec<Value> = if classic {
+    list(q, "options")
+      .iter()
+      .map(|o| json!({ "id": txt(o, "id"), "text": txt(o, "text") }))
+      .collect()
   } else {
     Vec::new()
   };
-  json!({
+  let pairs: Vec<Value> = if classic {
+    list(q, "pairs")
+      .iter()
+      .map(|p| json!({ "id": txt(p, "id"), "left": txt(p, "left") }))
+      .collect()
+  } else {
+    Vec::new()
+  };
+  let rights: Vec<Value> = if kind == "matching" {
+    sorted_rights(q, course)
+  } else {
+    Vec::new()
+  };
+  let mut out = json!({
     "id": txt(q, "id"),
     "kind": kind,
     "prompt": txt(q, "prompt"),
@@ -949,11 +1352,26 @@ fn public_question(q: &Value, course: Uuid, uid: i64) -> Value {
     "options": options,
     "pairs": pairs,
     "rights": rights,
-  })
+  });
+  if let Some(o) = out.as_object_mut() {
+    match kind {
+      "fill_blank" => {
+        o.insert("blank".to_string(), json!(true));
+      },
+      "ordering" => {
+        o.insert("items".to_string(), Value::Array(shuffled_items(q, course)));
+      },
+      "hotspot" => {
+        o.insert("image".to_string(), public_image(q));
+      },
+      _ => {},
+    }
+  }
+  out
 }
 
 /// All-or-nothing grading of one answer.
-fn is_correct(q: &Value, answer: &Value, course: Uuid, uid: i64) -> bool {
+fn is_correct(q: &Value, answer: &Value, course: Uuid) -> bool {
   match kind_of(q) {
     "multiple" => {
       let want: BTreeSet<&str> = list(q, "options")
@@ -976,10 +1394,9 @@ fn is_correct(q: &Value, answer: &Value, course: Uuid, uid: i64) -> bool {
       if pairs.is_empty() {
         return false;
       }
-      let by_token: HashMap<String, &str> = pairs
-        .iter()
-        .map(|p| (pair_token(course, uid, txt(p, "id")), txt(p, "right").trim()))
-        .collect();
+      // S2: each token maps back to its text; right = the pair's own right side.
+      let texts = right_texts(q);
+      let by_token = text_by_token(course, &texts);
       pairs.iter().all(|p| {
         let want = txt(p, "right").trim();
         chosen
@@ -990,6 +1407,9 @@ fn is_correct(q: &Value, answer: &Value, course: Uuid, uid: i64) -> bool {
           .unwrap_or(false)
       })
     },
+    "fill_blank" => blank_correct(q, answer),
+    "ordering" => ordering_correct(q, answer, course),
+    "hotspot" => hotspot_hit(q, answer),
     _ => {
       let pick = answer.as_str().unwrap_or("");
       !pick.is_empty()
@@ -1001,7 +1421,7 @@ fn is_correct(q: &Value, answer: &Value, course: Uuid, uid: i64) -> bool {
 }
 
 /// The right answer in the same shape the browser sends answers.
-fn correct_answer(q: &Value, course: Uuid, uid: i64) -> Value {
+fn correct_answer(q: &Value, course: Uuid) -> Value {
   match kind_of(q) {
     "multiple" => Value::Array(
       list(q, "options")
@@ -1011,15 +1431,28 @@ fn correct_answer(q: &Value, course: Uuid, uid: i64) -> Value {
         .collect(),
     ),
     "matching" => {
+      // S2: each pair's own right side, as its text token.
+      let texts = right_texts(q);
       let mut m = Map::new();
-      for p in list(q, "pairs") {
-        m.insert(
-          txt(p, "id").to_string(),
-          json!(pair_token(course, uid, txt(p, "id"))),
-        );
+      for (p, token) in list(q, "pairs").iter().zip(text_tokens(course, &texts)) {
+        m.insert(txt(p, "id").to_string(), json!(token));
       }
       Value::Object(m)
     },
+    "fill_blank" => Value::Array(blank_answers(q).into_iter().map(|a| json!(a)).collect()),
+    "ordering" => Value::Array(
+      text_tokens(course, &item_texts(q))
+        .into_iter()
+        .map(|token| json!(token))
+        .collect(),
+    ),
+    "hotspot" => Value::Array(
+      list(q, "spots")
+        .iter()
+        .filter_map(spot_of)
+        .map(|(x, y, w, h)| json!({ "x": x, "y": y, "w": w, "h": h }))
+        .collect(),
+    ),
     _ => list(q, "options")
       .iter()
       .find(|o| flag(o, "correct", false))
@@ -1237,7 +1670,7 @@ async fn play(state: &AppState, user: &UserUuid, ws: &str, id: &str) -> Result<V
   let questions: Vec<Value> = if st.quiz_on {
     pick_questions(&content, &st, course, uid, used.saturating_add(1))
       .into_iter()
-      .map(|q| public_question(q, course, uid))
+      .map(|q| public_question(q, course))
       .collect()
   } else {
     Vec::new()
@@ -1300,6 +1733,14 @@ async fn progress(
     .saturating_sub(enr.last_ms)
     .max(0)
     .saturating_add(HEARTBEAT_CAP_MS);
+  // S1: and all accepted time together can't run ahead of the real time since
+  // the start (+60 s), so two open tabs don't count twice. (open_record sets
+  // started_ms when it auto-starts the course.)
+  let wall = now
+    .saturating_sub(enr.started_ms)
+    .max(0)
+    .saturating_add(HEARTBEAT_CAP_MS);
+  budget = budget.min(wall.saturating_sub(enr.time_ms).max(0));
   let mut rejected: Vec<Value> = Vec::new();
   let mut stored: Vec<Ev> = Vec::new();
   for (i, ev) in events.iter().enumerate() {
@@ -1427,8 +1868,24 @@ async fn progress(
   if let Some(ev) = status_change(&before, &enr, now) {
     stored.push(ev);
   }
+  // S3: skip a kc_answer / block_complete / lesson_open that is already stored
+  // (same kind, lesson, block and data; time aside), and store nothing past
+  // MAX_STORED_EVENTS for this person and course. Progress above still counts.
+  let mut logged = if stored.is_empty() {
+    0
+  } else {
+    events_stored(&mut tx, course, c.uid()).await?
+  };
   for ev in stored {
+    if logged >= MAX_STORED_EVENTS {
+      break;
+    }
+    let repeatable = matches!(ev.kind.as_str(), "kc_answer" | "block_complete" | "lesson_open");
+    if repeatable && event_seen(&mut tx, course, c.uid(), &ev).await? {
+      continue;
+    }
     log_event(&mut tx, c.ws, course, c.uid(), ev).await?;
+    logged = logged.saturating_add(1);
   }
   tx.commit().await?;
   Ok(json!({ "enrollment": enr.full_json(), "rejected": rejected }))
@@ -1468,9 +1925,20 @@ async fn submit_quiz(
   let mut total: i64 = 0;
   let mut earned: i64 = 0;
   let mut graded: Vec<(&Value, bool, i64)> = Vec::new();
+  // S3: only this attempt's answers are stored, each at most MAX_KC_BYTES
+  // (bigger ones are stored as null), like knowledge-check answers.
+  let mut stored_answers = Map::new();
   for q in questions {
     let pts = points_of(q);
-    let ok = is_correct(q, answers.get(txt(q, "id")).unwrap_or(&null), course, uid);
+    let ok = is_correct(q, answers.get(txt(q, "id")).unwrap_or(&null), course);
+    if let Some(a) = answers.get(txt(q, "id")) {
+      let keep = if a.to_string().len() > MAX_KC_BYTES {
+        Value::Null
+      } else {
+        a.clone()
+      };
+      stored_answers.insert(txt(q, "id").to_string(), keep);
+    }
     total = total.saturating_add(pts);
     if ok {
       earned = earned.saturating_add(pts);
@@ -1507,7 +1975,7 @@ async fn submit_quiz(
     let feedback = if *ok { "feedback_correct" } else { "feedback_incorrect" };
     r.insert("feedback".to_string(), json!(txt(q, feedback)));
     if reveal {
-      r.insert("correct_answer".to_string(), correct_answer(q, course, uid));
+      r.insert("correct_answer".to_string(), correct_answer(q, course));
       r.insert("explanation".to_string(), json!(txt(q, "explanation")));
     }
     results.push(Value::Object(r));
@@ -1526,7 +1994,7 @@ async fn submit_quiz(
   .bind(uid)
   .bind(enr.version)
   .bind(attempt)
-  .bind(Value::Object(answers.clone()).to_string())
+  .bind(Value::Object(stored_answers).to_string())
   .bind(Value::Array(kept).to_string())
   .bind(score32)
   .bind(passed)
@@ -2101,11 +2569,56 @@ async fn studio_delete(
 fn url_ok(raw: &str) -> bool {
   let url = raw.trim();
   let lower = url.to_ascii_lowercase();
+  // S4: "//host" and "/\host" are other websites to a browser, not Care Hub links.
   (lower.starts_with("https://") && lower.len() > "https://".len())
     || lower == "http://localhost"
     || lower.starts_with("http://localhost/")
     || lower.starts_with("http://localhost:")
-    || (url.starts_with('/') && !url.starts_with("//"))
+    || (url.starts_with('/') && !url.starts_with("//") && !url.starts_with("/\\"))
+}
+
+/// S5: the only sites an embed block may show (the web app uses the same list).
+/// Shown in a frame: Google Docs / Forms, Microsoft Forms, Canva, Genially,
+/// Miro, Figma, Scribe, Tango. Video (the web plays these itself): YouTube,
+/// Vimeo, Loom.
+const EMBED_HOSTS: &[&str] = &[
+  "docs.google.com",
+  "forms.gle",
+  "forms.office.com",
+  "forms.microsoft.com",
+  "www.canva.com",
+  "view.genial.ly",
+  "miro.com",
+  "www.figma.com",
+  "scribehow.com",
+  "app.tango.us",
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "youtu.be",
+  "youtube-nocookie.com",
+  "www.youtube-nocookie.com",
+  "vimeo.com",
+  "www.vimeo.com",
+  "player.vimeo.com",
+  "loom.com",
+  "www.loom.com",
+];
+
+/// S5: an embed link is https:// to a host in EMBED_HOSTS (the lowercased text
+/// up to the first / ? #), with no port and no "@" anywhere. Care Hub and
+/// relative links aren't embeds.
+fn embed_ok(raw: &str) -> bool {
+  let lower = raw.trim().to_ascii_lowercase();
+  let rest = match lower.strip_prefix("https://") {
+    Some(r) => r,
+    None => return false,
+  };
+  let host = rest
+    .split(|c: char| c == '/' || c == '?' || c == '#')
+    .next()
+    .unwrap_or("");
+  !lower.contains('@') && !host.contains(':') && EMBED_HOSTS.contains(&host)
 }
 
 fn lesson_name(index: usize, lesson: &Value) -> String {
@@ -2116,6 +2629,22 @@ fn lesson_name(index: usize, lesson: &Value) -> String {
     let short: String = title.chars().take(40).collect();
     let dots = if title.chars().count() > 40 { "…" } else { "" };
     format!("Lesson {} (\"{}{}\")", index + 1, short, dots)
+  }
+}
+
+/// What's wrong with a hotspot / labeled graphic picture link, if anything
+/// (same link rule as image blocks).
+fn picture_problem(image: &Value, who: &str) -> Option<String> {
+  let url = txt(image, "url").trim();
+  if url.is_empty() {
+    Some(format!("{} needs a picture.", who))
+  } else if !url_ok(url) {
+    Some(format!(
+      "{} needs a picture link that starts with https:// (or a Care Hub link starting with /).",
+      who
+    ))
+  } else {
+    None
   }
 }
 
@@ -2176,6 +2705,51 @@ fn check_question(q: &Value, label: &str, problems: &mut Vec<String>) {
         ));
       }
     },
+    "fill_blank" => {
+      let accepted = blank_answers(q);
+      if accepted.is_empty() {
+        problems.push(format!("{} needs at least one accepted answer.", label));
+      } else if accepted
+        .iter()
+        .any(|a| a.chars().count() > MAX_ACCEPTED_CHARS)
+      {
+        problems.push(format!("{} has an accepted answer that is too long.", label));
+      }
+    },
+    "ordering" => {
+      let items = list(q, "items");
+      let mut ids: HashSet<&str> = HashSet::new();
+      let bad_ids = items.iter().any(|it| {
+        let id = txt(it, "id").trim();
+        id.is_empty() || !ids.insert(id)
+      });
+      if items.len() < 2 {
+        problems.push(format!("{} needs at least two items to put in order.", label));
+      } else if items.iter().any(|it| txt(it, "text").trim().is_empty()) {
+        problems.push(format!("{} has an empty item.", label));
+      } else if bad_ids {
+        problems.push(format!(
+          "{} has items with missing or repeated ids. Try deleting and re-adding them.",
+          label
+        ));
+      }
+    },
+    "hotspot" => {
+      let none = Value::Null;
+      let image = q.get("image").unwrap_or(&none);
+      if let Some(p) = picture_problem(image, label) {
+        problems.push(p);
+      }
+      if txt(image, "alt").trim().is_empty() {
+        problems.push(format!("{} needs a picture description.", label));
+      }
+      let spots = list(q, "spots");
+      if spots.is_empty() {
+        problems.push(format!("{} needs at least one right spot.", label));
+      } else if spots.iter().any(|s| !spot_inside(s)) {
+        problems.push(format!("{} has a spot outside the picture.", label));
+      }
+    },
     _ => problems.push(format!("{} has an unknown question type.", label)),
   }
 }
@@ -2191,6 +2765,14 @@ fn check_block(b: &Value, at: &str, problems: &mut Vec<String>) {
         problems.push(format!(
           "The {} link in {} must start with https:// (or be a Care Hub link starting with /).",
           kind, at
+        ));
+      } else if kind == "embed" && !embed_ok(url) {
+        // S5: on publish, embeds may only show the sites in EMBED_HOSTS.
+        problems.push(format!(
+          "The embed in {} can only show Google Docs or Forms, Microsoft Forms, Canva, Genially, \
+           Miro, Figma, Scribe, Tango, YouTube, Vimeo or Loom. For other websites, add a link \
+           instead.",
+          at
         ));
       }
     },
@@ -2235,6 +2817,23 @@ fn check_block(b: &Value, at: &str, problems: &mut Vec<String>) {
     "page_link" => {
       if txt(b, "view_id").trim().is_empty() {
         problems.push(format!("The page link in {} needs a page.", at));
+      }
+    },
+    "labeled_graphic" => {
+      let who = format!("The labeled graphic in {}", at);
+      let none = Value::Null;
+      let image = b.get("image").unwrap_or(&none);
+      if let Some(p) = picture_problem(image, &who) {
+        problems.push(p);
+      }
+      if txt(image, "alt").trim().is_empty() {
+        problems.push(format!("{} needs a picture description.", who));
+      }
+      let markers = list(b, "markers");
+      if markers.is_empty() {
+        problems.push(format!("{} needs at least one marker.", who));
+      } else if markers.iter().any(|m| txt(m, "title").trim().is_empty()) {
+        problems.push(format!("{} has a marker without a title.", who));
       }
     },
     _ => {},

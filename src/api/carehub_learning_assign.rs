@@ -16,6 +16,12 @@
 //! days after they're added", renewal of finishes after N months (heads-up,
 //! progress reset, renewal due) and the assignment side of learning paths
 //! (carehub_learning_paths.rs).
+//!
+//! Lane notices (hunks marked P6 notices): after a new version is published,
+//! telling the people who finished an earlier one what changed (or asking
+//! them to take it again), "check this course" reminders for course owners,
+//! marking someone complete by hand (and undoing it) and the learning path
+//! report (carehub_learning_paths.rs).
 
 use crate::api::carehub_calendar;
 use crate::api::carehub_extras;
@@ -41,6 +47,8 @@ static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
 static CERT_FLAGS: Mutex<BTreeMap<(Uuid, i32), bool>> = Mutex::new(BTreeMap::new());
 /// P2 recert: settings.recert_months per published version (None = never).
 static RECERT: Mutex<BTreeMap<(Uuid, i32), Option<i64>>> = Mutex::new(BTreeMap::new());
+/// P6 notices: settings.review_months per published version (None = never).
+static REVIEW: Mutex<BTreeMap<(Uuid, i32), Option<i64>>> = Mutex::new(BTreeMap::new());
 
 const TABLE_LOCK_KEY: i64 = 7_316_402_220;
 const WS_LOCK_CLASS: i32 = 7_316_403;
@@ -73,6 +81,15 @@ const RENEW_DAYS: i64 = 30;
 const QUIZ_ATTEMPTS_CAP: i64 = 5000;
 /// No 0/O/1/I/L, so codes can be read out and typed without mistakes.
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+/// P6 notices: "check this course" every 1-24 months; reminders per run.
+const MAX_REVIEW_MONTHS: i64 = 24;
+const REVIEW_BATCH: usize = 50;
+/// P6 notices: the reason for marking someone complete.
+const MAX_REASON_CHARS: usize = 200;
+/// P6 notices: default days to take a course again after an update.
+const RETAKE_DAYS: i32 = 14;
+/// P6 notices: certificate rounds (CERT_BATCH each) before a "take it again".
+const CERT_ROUNDS: usize = 20;
 
 const SETUP_MSG: &str = "Learning is still being set up. Please try again in a minute.";
 const SERVER_MSG: &str = "Something went wrong on the server. Please try again in a moment.";
@@ -107,6 +124,23 @@ const DAYS_MSG: &str = "Pick a number of days between 1 and 365.";
 // P2 recert
 const RETAKE_MSG: &str = "You can take this course again once it runs out.";
 const RECERT_MSG: &str = "Renewal must be between 1 and 60 months (or leave it empty).";
+// P6 notices
+const BUILD_MSG: &str =
+  "You need the \"Build courses\" permission for this. Ask an admin to update your role.";
+const VERSION_MSG: &str =
+  "That isn't the version that's live now. Please reload the page and try again.";
+const LIVE_MSG: &str = "This course isn't published right now, so nobody was told.";
+const CHANGES_MSG: &str = "Add a note about what changed before telling people.";
+const PERSON_LINK_MSG: &str = "That person link doesn't look right.";
+const NOT_ON_MSG: &str =
+  "That person isn't on this assignment any more. Please reload the page and try again.";
+const DONE_MSG: &str = "They've already finished this course.";
+const REASON_MSG: &str = "Keep the reason to 200 characters or fewer.";
+const UNDO_MSG: &str =
+  "There's nothing to undo: their progress has changed since they were marked complete.";
+const MARK_DRAFT_MSG: &str = "Publish this course before marking anyone complete.";
+const MARK_ARCHIVED_MSG: &str =
+  "This course is archived. Unarchive it before marking anyone complete.";
 
 /// P1 due_days / P2 recert: the due of one person's row (s = assignee, a =
 /// assignment) in SQL: a renewal due, else 23:59:59.999 local on the day N
@@ -210,6 +244,25 @@ const TABLES: &[&str] = &[
      wake_ms BIGINT NOT NULL DEFAULT 0, heads_up_ms BIGINT NOT NULL DEFAULT 0, \
      renewed_ms BIGINT NOT NULL DEFAULT 0, due_ms BIGINT, \
      PRIMARY KEY (course_id, uid, finished_ms))",
+  // P6 notices: the last version people were told about (once per version),
+  // the "check this course" clock and finishes marked by hand (kept after an
+  // undo, as the record).
+  "CREATE TABLE IF NOT EXISTS carehub_learning_announce (\
+     course_id UUID PRIMARY KEY REFERENCES carehub_course (id) ON DELETE CASCADE, \
+     workspace_id UUID NOT NULL, version INT NOT NULL, action TEXT NOT NULL, due_days INT, \
+     people INT NOT NULL DEFAULT 0, by_uid BIGINT NOT NULL, created_ms BIGINT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS carehub_learning_review (\
+     course_id UUID PRIMARY KEY REFERENCES carehub_course (id) ON DELETE CASCADE, \
+     workspace_id UUID NOT NULL, checked_ms BIGINT NOT NULL DEFAULT 0, checked_by BIGINT, \
+     sent_due_ms BIGINT NOT NULL DEFAULT 0, sent_ms BIGINT NOT NULL DEFAULT 0, sent_to BIGINT)",
+  "CREATE TABLE IF NOT EXISTS carehub_learning_manual (\
+     course_id UUID NOT NULL REFERENCES carehub_course (id) ON DELETE CASCADE, \
+     uid BIGINT NOT NULL, completed_ms BIGINT NOT NULL, workspace_id UUID NOT NULL, \
+     started_ms BIGINT NOT NULL, by_uid BIGINT NOT NULL, reason TEXT NOT NULL DEFAULT '', \
+     before JSONB, renew_dues JSONB NOT NULL DEFAULT '[]'::jsonb, event_id BIGINT, \
+     undone_ms BIGINT, undone_by BIGINT, PRIMARY KEY (course_id, uid, completed_ms))",
+  "CREATE INDEX IF NOT EXISTS carehub_learning_manual_ws \
+     ON carehub_learning_manual (workspace_id, course_id)",
 ];
 
 /// Creates the Phase 2 tables once (after the Phase 1 ones they point at).
@@ -480,7 +533,8 @@ pub(crate) fn need_read(c: &Ctx) -> Result<(), AppError> {
   }
 }
 
-fn need_reports(c: &Ctx) -> Result<(), AppError> {
+/// P6 notices: pub(crate) for the path report.
+pub(crate) fn need_reports(c: &Ctx) -> Result<(), AppError> {
   if c.has("learning_build") || c.has("learning_analytics") {
     Ok(())
   } else {
@@ -894,7 +948,8 @@ fn with_counts(mut v: Value, t: &Tally, total_key: &str) -> Value {
 pub(crate) struct Enr {
   pub(crate) status: String,
   pub(crate) percent: i32,
-  completed_ms: Option<i64>,
+  /// P6 notices: pub(crate) for the path report.
+  pub(crate) completed_ms: Option<i64>,
 }
 
 /// Everything the assignment lists and reports need, loaded once per request.
@@ -1058,7 +1113,8 @@ impl Board {
     with_counts(v, &t, "people")
   }
 
-  fn people_json(&self, a: &Asg) -> Vec<Value> {
+  /// P6 notices: `marked` = finishes marked by hand that are still theirs.
+  fn people_json(&self, a: &Asg, marked: &HashMap<i64, Value>) -> Vec<Value> {
     let mut out: Vec<(String, Value)> = Vec::new();
     if let Some(uids) = self.rows.get(&a.id) {
       for uid in uids {
@@ -1088,6 +1144,8 @@ impl Board {
             "completed_ms": e.and_then(|x| x.completed_ms),
             "expires_ms": expires,
             "expired": expires.map(|t| t <= self.now).unwrap_or(false),
+            // P6 notices
+            "marked": marked.get(uid).cloned().unwrap_or(Value::Null),
           }),
         ));
       }
@@ -1950,9 +2008,11 @@ async fn get_assignment(
   let mut conn = pool.acquire().await?;
   let groups = groups_of(&mut conn, c.ws).await?;
   let names = names_of(pool, vec![a.created_by]).await?;
+  // P6 notices
+  let marked = marked_on(pool, c.ws, course).await?;
   Ok(json!({
     "assignment": board.assignment_json(a, &groups, &names),
-    "people": board.people_json(a),
+    "people": board.people_json(a, &marked),
   }))
 }
 
@@ -2126,13 +2186,15 @@ async fn assigned(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, 
   }
   let ids: Vec<Uuid> = eff.keys().copied().collect();
   // Same card as Phase 1 /catalog and /my (the version the caller is on).
+  // P6 notices: side lessons (`branch: true`) aren't counted in `lessons`.
   let cards: Vec<CardRow> = sqlx::query_as(
     "SELECT c.id, c.status, v.published_ms, v.version, \
        COALESCE(NULLIF(BTRIM(v.content->>'title'), ''), NULLIF(c.title, ''), 'Untitled course'), \
        COALESCE(v.content->>'summary', ''), COALESCE(v.content->>'cover', ''), \
        COALESCE(v.content->>'preset', 'standard'), \
-       (CASE WHEN jsonb_typeof(v.content->'lessons') = 'array' \
-         THEN jsonb_array_length(v.content->'lessons') ELSE 0 END)::INT, \
+       (SELECT COUNT(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(v.content->'lessons') \
+         = 'array' THEN v.content->'lessons' ELSE '[]'::jsonb END) AS x \
+         WHERE x->'branch' IS DISTINCT FROM 'true'::jsonb)::INT, \
        (CASE WHEN jsonb_typeof(v.content->'est_minutes') = 'number' \
          THEN LEAST(GREATEST((v.content->>'est_minutes')::NUMERIC, 0), 100000) ELSE 0 END)::INT, \
        (COALESCE(v.content->'quiz'->>'enabled', 'false') = 'true' \
@@ -3308,7 +3370,10 @@ fn row_course(row: &Value, course: Option<Uuid>) -> Option<Uuid> {
 
 /// Progress rows of one course (`course`) or with a course_id each: report
 /// rows and the Player's enrollment. Never fails the request.
+/// P6 notices: `marked` too (add_row_marked).
 pub(crate) async fn add_row_expiry(pool: &PgPool, rows: &mut [Value], course: Option<Uuid>) {
+  // P6 notices
+  add_row_marked(pool, rows, course).await;
   let mut ids: Vec<Uuid> = rows.iter().filter_map(|r| row_course(r, course)).collect();
   ids.sort();
   ids.dedup();
@@ -3848,6 +3913,1145 @@ async fn retake(state: &AppState, user: &UserUuid, ws: &str, id: &str) -> Result
 }
 
 // ---------------------------------------------------------------------------
+// P6 notices: telling people about a new version, "check this course"
+// reminders, marking someone complete by hand
+// ---------------------------------------------------------------------------
+
+/// P6 notices: the publish permission (same words as carehub_learning.rs).
+fn need_build(c: &Ctx) -> Result<(), AppError> {
+  if c.has("learning_build") {
+    Ok(())
+  } else {
+    Err(bad(BUILD_MSG))
+  }
+}
+
+/// P6 notices: a count for an INT column.
+fn count_i32(n: usize) -> i32 {
+  i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// P6 notices: one learning event (the row carehub_learning.rs logs); its id.
+async fn add_event(
+  conn: &mut PgConnection,
+  ws: Uuid,
+  course: Uuid,
+  uid: i64,
+  kind: &str,
+  data: &Value,
+  ts: i64,
+) -> Result<i64, AppError> {
+  let id: i64 = sqlx::query_scalar(
+    "INSERT INTO carehub_learning_event \
+       (workspace_id, course_id, uid, kind, lesson_id, block_id, data, ts_ms) \
+     VALUES ($1, $2, $3, $4, '', '', $5::jsonb, $6) RETURNING id",
+  )
+  .bind(ws)
+  .bind(course)
+  .bind(uid)
+  .bind(kind)
+  .bind(data.to_string())
+  .bind(ts)
+  .fetch_one(&mut *conn)
+  .await?;
+  Ok(id)
+}
+
+/// P6 notices: messages sent after the reply (best effort, never retried).
+fn send_later(pool: &PgPool, messages: Vec<(i64, String)>) {
+  if messages.is_empty() {
+    return;
+  }
+  let pool = pool.clone();
+  tokio::spawn(async move {
+    for (uid, body) in messages {
+      send(&pool, uid, &body).await;
+    }
+  });
+}
+
+/// P6 notices: current non-guest members other than the caller who finished a
+/// course (on a version below `below`, if given), and their rows on it.
+struct Finishers {
+  course: Uuid,
+  uids: Vec<i64>,
+  covers: HashMap<(Uuid, i64), Cover>,
+}
+
+impl Finishers {
+  /// An assignment covers them now (they would get a due date).
+  fn assigned(&self, uid: i64) -> bool {
+    self
+      .covers
+      .get(&(self.course, uid))
+      .map(|c| !c.keep.is_empty())
+      .unwrap_or(false)
+  }
+
+  fn assigned_count(&self) -> usize {
+    self.uids.iter().filter(|u| self.assigned(**u)).count()
+  }
+}
+
+async fn finishers(
+  pool: &PgPool,
+  ws: Uuid,
+  course: Uuid,
+  caller: i64,
+  below: Option<i32>,
+) -> Result<Finishers, AppError> {
+  let found: Vec<i64> = sqlx::query_scalar(
+    "SELECT uid FROM carehub_enrollment WHERE course_id = $1 \
+       AND status IN ('completed', 'passed') AND ($2::INT IS NULL OR version < $2) ORDER BY uid",
+  )
+  .bind(course)
+  .bind(below)
+  .fetch_all(pool)
+  .await?;
+  let people = people_of(pool, ws).await?;
+  let uids: Vec<i64> = found
+    .into_iter()
+    .filter(|u| *u != caller && people.has(*u))
+    .collect();
+  let mut covers = HashMap::new();
+  if !uids.is_empty() {
+    let mut conn = pool.acquire().await?;
+    let groups = groups_of(&mut conn, ws).await?;
+    drop(conn);
+    let pairs: Vec<(Uuid, i64)> = uids.iter().map(|u| (course, *u)).collect();
+    covers = covers_of(pool, &pairs, &people, &groups).await?;
+  }
+  Ok(Finishers {
+    course,
+    uids,
+    covers,
+  })
+}
+
+/// P6 notices: GET /studio/{id}/announce (build): the live and the last
+/// announced version, who finished (not the caller) and how many of them are
+/// assigned. Never published → nulls and zeros.
+async fn announce_info(
+  state: &AppState,
+  user: &UserUuid,
+  ws: &str,
+  id: &str,
+) -> Result<Value, AppError> {
+  let c = ctx(state, user, ws).await?;
+  need_build(&c)?;
+  let course = parse_uuid(id, COURSE_LINK_MSG)?;
+  let pool = &state.pg_pool;
+  let head: Option<(Option<i32>, Option<i32>)> = sqlx::query_as(
+    "SELECT c.published_version, a.version FROM carehub_course c \
+     LEFT JOIN carehub_learning_announce a ON a.course_id = c.id \
+     WHERE c.id = $1 AND c.workspace_id = $2",
+  )
+  .bind(course)
+  .bind(c.ws)
+  .fetch_optional(pool)
+  .await?;
+  let (live, announced) = head.ok_or_else(missing)?;
+  let (finished_n, assigned_n) = match live {
+    Some(_) => {
+      let f = finishers(pool, c.ws, course, c.uid(), None).await?;
+      (f.uids.len(), f.assigned_count())
+    },
+    None => (0, 0),
+  };
+  Ok(json!({
+    "published_version": live,
+    "announced_version": announced,
+    "finished": finished_n,
+    "assigned": assigned_n,
+  }))
+}
+
+/// P6 notices: the row that claims a version for an announcement.
+struct Announce<'a> {
+  course: Uuid,
+  ws: Uuid,
+  version: i32,
+  action: &'a str,
+  due_days: Option<i32>,
+  by: i64,
+  now: i64,
+}
+
+/// false = this version (or a later one) was announced already.
+async fn claim_announce(
+  conn: &mut PgConnection,
+  a: &Announce<'_>,
+  people: usize,
+) -> Result<bool, AppError> {
+  let done = sqlx::query(
+    "INSERT INTO carehub_learning_announce \
+       (course_id, workspace_id, version, action, due_days, people, by_uid, created_ms) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+     ON CONFLICT (course_id) DO UPDATE SET workspace_id = EXCLUDED.workspace_id, \
+       version = EXCLUDED.version, action = EXCLUDED.action, due_days = EXCLUDED.due_days, \
+       people = EXCLUDED.people, by_uid = EXCLUDED.by_uid, created_ms = EXCLUDED.created_ms \
+     WHERE carehub_learning_announce.version < EXCLUDED.version",
+  )
+  .bind(a.course)
+  .bind(a.ws)
+  .bind(a.version)
+  .bind(a.action)
+  .bind(a.due_days)
+  .bind(count_i32(people))
+  .bind(a.by)
+  .bind(a.now)
+  .execute(&mut *conn)
+  .await?;
+  Ok(done.rows_affected() > 0)
+}
+
+/// P6 notices: POST /studio/{id}/announce (build), once per version, for the
+/// people who finished an earlier version: "tell" sends what changed;
+/// "retake" issues the certificates of their finishes, then in one
+/// transaction resets them (assigned → a renewal-style due `due_days` from
+/// today; not assigned → a fresh start on the new version). Messages go out
+/// in the background after the commit.
+async fn announce(
+  state: &AppState,
+  user: &UserUuid,
+  ws: &str,
+  id: &str,
+  body: &[u8],
+) -> Result<Value, AppError> {
+  let c = ctx(state, user, ws).await?;
+  need_build(&c)?;
+  let course = parse_uuid(id, COURSE_LINK_MSG)?;
+  let body = body_json(body)?;
+  let action = match txt(&body, "action") {
+    "tell" => "tell",
+    "retake" => "retake",
+    _ => return Err(bad(BODY_MSG)),
+  };
+  let version = body
+    .get("version")
+    .and_then(|v| v.as_i64())
+    .and_then(|v| i32::try_from(v).ok())
+    .ok_or_else(|| bad(BODY_MSG))?;
+  let due_days = if action == "retake" {
+    Some(parse_days(body.get("due_days"))?.unwrap_or(RETAKE_DAYS))
+  } else {
+    None
+  };
+  let pool = &state.pg_pool;
+  let head: Option<(String, Option<i32>, Option<i32>)> = sqlx::query_as(
+    "SELECT c.status, c.published_version, a.version FROM carehub_course c \
+     LEFT JOIN carehub_learning_announce a ON a.course_id = c.id \
+     WHERE c.id = $1 AND c.workspace_id = $2",
+  )
+  .bind(course)
+  .bind(c.ws)
+  .fetch_optional(pool)
+  .await?;
+  let (status, live, announced) = head.ok_or_else(missing)?;
+  match live {
+    Some(v) if status == "published" => {
+      if v != version {
+        return Err(bad(VERSION_MSG));
+      }
+    },
+    _ => return Err(bad(LIVE_MSG)),
+  }
+  let already = json!({
+    "ok": true,
+    "already": true,
+    "version": version,
+    "action": action,
+    "people": 0,
+    "assigned": 0,
+  });
+  if announced.map(|x| x >= version).unwrap_or(false) {
+    return Ok(already);
+  }
+  let note: Option<String> = sqlx::query_scalar(
+    "SELECT note FROM carehub_course_version WHERE course_id = $1 AND version = $2",
+  )
+  .bind(course)
+  .bind(version)
+  .fetch_optional(pool)
+  .await?;
+  let note = note.unwrap_or_default().trim().to_string();
+  if note.is_empty() {
+    return Err(bad(CHANGES_MSG));
+  }
+  let title = titles_of(pool, &[course])
+    .await?
+    .remove(&course)
+    .unwrap_or_else(|| "Untitled course".to_string());
+  let link = course_link(course);
+  let a = Announce {
+    course,
+    ws: c.ws,
+    version,
+    action,
+    due_days,
+    by: c.uid(),
+    now: now_ms(),
+  };
+  if action == "tell" {
+    let f = finishers(pool, c.ws, course, c.uid(), Some(version)).await?;
+    let mut conn = pool.acquire().await?;
+    if !claim_announce(&mut conn, &a, f.uids.len()).await? {
+      return Ok(already);
+    }
+    drop(conn);
+    let body = format!(
+      "📝 “{}” has been updated. What changed: {}\n{}",
+      title, note, link
+    );
+    send_later(pool, f.uids.iter().map(|u| (*u, body.clone())).collect());
+    return Ok(json!({
+      "ok": true,
+      "already": false,
+      "version": version,
+      "action": action,
+      "people": f.uids.len(),
+      "assigned": f.assigned_count(),
+    }));
+  }
+  // Take it again: certificates for their finishes first (as renewals do).
+  for _ in 0..CERT_ROUNDS {
+    if issue_certificates(pool, Some(c.ws), None, Some(course)).await? == 0 {
+      break;
+    }
+  }
+  let f = finishers(pool, c.ws, course, c.uid(), Some(version)).await?;
+  let days = i64::from(due_days.unwrap_or(RETAKE_DAYS));
+  let mut tx = pool.begin().await?;
+  lock_ws(&mut tx, c.ws).await?;
+  if !claim_announce(&mut tx, &a, f.uids.len()).await? {
+    return Ok(already);
+  }
+  let none = Cover::new();
+  let mut messages: Vec<(i64, String)> = Vec::new();
+  let mut assigned_n = 0usize;
+  for uid in &f.uids {
+    let uid = *uid;
+    let enr: Option<(String, Option<i64>, Option<i32>, i32)> = sqlx::query_as(
+      "SELECT status, completed_ms, score, version FROM carehub_enrollment \
+       WHERE course_id = $1 AND uid = $2 FOR UPDATE",
+    )
+    .bind(course)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // Still finished on an earlier version (else someone got there first).
+    let data = match enr {
+      Some((st, completed_ms, score, v)) if finished(&st) && v < version => json!({
+        "by": "new_version",
+        "to_version": version,
+        "completed_ms": completed_ms,
+        "status": st,
+        "score": score,
+        "version": v,
+      }),
+      _ => continue,
+    };
+    carehub_learning::reset_progress(&mut tx, c.ws, course, uid, data).await?;
+    let cover = f.covers.get(&(course, uid)).unwrap_or(&none);
+    // Rows that no longer cover them go (a sync would remove them now).
+    if !cover.stale.is_empty() {
+      sqlx::query(
+        "DELETE FROM carehub_learning_assignee \
+         WHERE course_id = $1 AND uid = $2 AND assignment_id = ANY($3)",
+      )
+      .bind(course)
+      .bind(uid)
+      .bind(cover.stale.clone())
+      .execute(&mut *tx)
+      .await?;
+    }
+    if cover.keep.is_empty() {
+      // Not assigned: a fresh start on the new version (My learning → In progress).
+      let started = sqlx::query(
+        "INSERT INTO carehub_enrollment \
+           (course_id, uid, version, status, progress, started_ms, last_ms) \
+         VALUES ($1, $2, $3, 'in_progress', '{}'::jsonb, $4, $4) \
+         ON CONFLICT (course_id, uid) DO NOTHING",
+      )
+      .bind(course)
+      .bind(uid)
+      .bind(version)
+      .bind(a.now)
+      .execute(&mut *tx)
+      .await?;
+      if started.rows_affected() > 0 {
+        let data = json!({ "by": "new_version" });
+        add_event(&mut tx, c.ws, course, uid, "start", &data, a.now).await?;
+      }
+      let body = format!(
+        "🔁 “{}” has been updated. Please take it again. What changed: {}\n{}",
+        title, note, link
+      );
+      messages.push((uid, body));
+    } else {
+      // Assigned: the renewal path (reminders re-armed, a pending "New course"
+      // message marked done), due 23:59:59.999 local `days` days from today.
+      let due = day_start(local_day(a.now, cover.tz) + days + 1, cover.tz) - 1;
+      sqlx::query(
+        "UPDATE carehub_learning_assignee SET renew_due_ms = $3, sent_due_ms = 0, \
+           sent_overdue_ms = 0, \
+           sent_assigned_ms = CASE WHEN sent_assigned_ms = 0 THEN -1 ELSE sent_assigned_ms END \
+         WHERE course_id = $1 AND uid = $2",
+      )
+      .bind(course)
+      .bind(uid)
+      .bind(due)
+      .execute(&mut *tx)
+      .await?;
+      let body = format!(
+        "🔁 “{}” has been updated. Please take it again by {}. What changed: {}\n{}",
+        title,
+        day_label(local_day(due, cover.tz)),
+        note,
+        link
+      );
+      messages.push((uid, body));
+      assigned_n += 1;
+    }
+  }
+  let people_n = messages.len();
+  if people_n != f.uids.len() {
+    sqlx::query("UPDATE carehub_learning_announce SET people = $2 WHERE course_id = $1")
+      .bind(course)
+      .bind(count_i32(people_n))
+      .execute(&mut *tx)
+      .await?;
+  }
+  tx.commit().await?;
+  send_later(pool, messages);
+  after_change(pool, vec![course]);
+  Ok(json!({
+    "ok": true,
+    "already": false,
+    "version": version,
+    "action": action,
+    "people": people_n,
+    "assigned": assigned_n,
+  }))
+}
+
+/// P6 notices: a whole number of months 1-24, else None (no reminders).
+fn review_value(v: Option<&Value>) -> Option<i64> {
+  v.and_then(|x| {
+    x.as_i64().or_else(|| {
+      x.as_f64()
+        .filter(|f| f.is_finite() && f.fract().abs() < 1e-9 && f.abs() < 1e9)
+        .map(|f| f as i64)
+    })
+  })
+  .filter(|n| (1..=MAX_REVIEW_MONTHS).contains(n))
+}
+
+/// P6 notices: review months of published versions, cached like RECERT.
+async fn review_for(pool: &PgPool, live: &[(Uuid, i32)]) -> Result<HashMap<Uuid, i64>, AppError> {
+  let mut out: HashMap<Uuid, i64> = HashMap::new();
+  let mut ask_courses: Vec<Uuid> = Vec::new();
+  let mut ask_versions: Vec<i32> = Vec::new();
+  for key in live {
+    let known = REVIEW.lock().ok().and_then(|m| m.get(key).copied());
+    match known {
+      Some(Some(n)) => {
+        out.insert(key.0, n);
+      },
+      Some(None) => {},
+      None => {
+        ask_courses.push(key.0);
+        ask_versions.push(key.1);
+      },
+    }
+  }
+  if ask_courses.is_empty() {
+    return Ok(out);
+  }
+  let rows: Vec<(Uuid, i32, Option<String>)> = sqlx::query_as(
+    "SELECT v.course_id, v.version, (v.content->'settings'->'review_months')::TEXT \
+     FROM carehub_course_version v \
+     JOIN UNNEST($1::UUID[], $2::INT[]) AS w(course_id, version) \
+       ON w.course_id = v.course_id AND w.version = v.version",
+  )
+  .bind(ask_courses)
+  .bind(ask_versions)
+  .fetch_all(pool)
+  .await?;
+  for (course, version, raw) in rows {
+    let value: Option<Value> = raw.and_then(|s| serde_json::from_str(&s).ok());
+    let months = review_value(value.as_ref());
+    if let Ok(mut m) = REVIEW.lock() {
+      m.insert((course, version), months);
+    }
+    if let Some(n) = months {
+      out.insert(course, n);
+    }
+  }
+  Ok(out)
+}
+
+/// P6 notices: (last_kind, last_ms, due_ms) of a "check this course" clock.
+fn review_clock(published_ms: i64, checked_ms: i64, months: i64) -> (&'static str, i64, i64) {
+  let (kind, last) = if checked_ms > published_ms {
+    ("checked", checked_ms)
+  } else {
+    ("published", published_ms)
+  };
+  (kind, last, add_months(last, months))
+}
+
+/// P6 notices: "3 Jun" (UTC day), with the year when it isn't this year.
+fn short_date(ms: i64, now: i64) -> String {
+  let (y, m, d) = civil_from_days(ms.div_euclid(DAY_MS));
+  let (this_year, _, _) = civil_from_days(now.div_euclid(DAY_MS));
+  let month = usize::try_from(m - 1)
+    .ok()
+    .and_then(|i| MONTHS.get(i).copied())
+    .unwrap_or("");
+  if y == this_year {
+    format!("{} {}", d, month)
+  } else {
+    format!("{} {} {}", d, month, y)
+  }
+}
+
+/// P6 notices: GET /content-checks (build): the clock of every published
+/// course whose live version asks for reminders.
+async fn content_checks(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, AppError> {
+  let c = ctx(state, user, ws).await?;
+  need_build(&c)?;
+  let pool = &state.pg_pool;
+  let rows: Vec<(Uuid, i32, i64, i64)> = sqlx::query_as(
+    "SELECT c.id, c.published_version, v.published_ms, COALESCE(r.checked_ms, 0) \
+     FROM carehub_course c \
+     JOIN carehub_course_version v ON v.course_id = c.id AND v.version = c.published_version \
+     LEFT JOIN carehub_learning_review r ON r.course_id = c.id \
+     WHERE c.workspace_id = $1 AND c.status = 'published'",
+  )
+  .bind(c.ws)
+  .fetch_all(pool)
+  .await?;
+  let live: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.0, r.1)).collect();
+  let months = review_for(pool, &live).await?;
+  let now = now_ms();
+  let mut checks: Vec<(i64, Value)> = Vec::new();
+  for (course, _, published_ms, checked_ms) in rows {
+    let n = match months.get(&course) {
+      Some(n) => *n,
+      None => continue,
+    };
+    let (kind, last_ms, due_ms) = review_clock(published_ms, checked_ms, n);
+    checks.push((
+      due_ms,
+      json!({
+        "course_id": course.to_string(),
+        "every_months": n,
+        "last_kind": kind,
+        "last_ms": last_ms,
+        "due_ms": due_ms,
+        "due": now >= due_ms,
+      }),
+    ));
+  }
+  checks.sort_by(|a, b| a.0.cmp(&b.0));
+  Ok(json!({ "checks": checks.into_iter().map(|x| x.1).collect::<Vec<Value>>() }))
+}
+
+/// P6 notices: POST /studio/{id}/mark-checked (build): restarts the clock
+/// without publishing (any course status).
+async fn mark_checked(
+  state: &AppState,
+  user: &UserUuid,
+  ws: &str,
+  id: &str,
+  body: &[u8],
+) -> Result<Value, AppError> {
+  let c = ctx(state, user, ws).await?;
+  need_build(&c)?;
+  let course = parse_uuid(id, COURSE_LINK_MSG)?;
+  body_json(body)?;
+  let pool = &state.pg_pool;
+  let head: Option<(String, Option<i32>, Option<i64>)> = sqlx::query_as(
+    "SELECT c.status, c.published_version, v.published_ms FROM carehub_course c \
+     LEFT JOIN carehub_course_version v ON v.course_id = c.id AND v.version = c.published_version \
+     WHERE c.id = $1 AND c.workspace_id = $2",
+  )
+  .bind(course)
+  .bind(c.ws)
+  .fetch_optional(pool)
+  .await?;
+  let (status, live, published_ms) = head.ok_or_else(missing)?;
+  let now = now_ms();
+  sqlx::query(
+    "INSERT INTO carehub_learning_review (course_id, workspace_id, checked_ms, checked_by) \
+     VALUES ($1, $2, $3, $4) \
+     ON CONFLICT (course_id) DO UPDATE SET checked_ms = EXCLUDED.checked_ms, \
+       checked_by = EXCLUDED.checked_by",
+  )
+  .bind(course)
+  .bind(c.ws)
+  .bind(now)
+  .bind(c.uid())
+  .execute(pool)
+  .await?;
+  let due = match live {
+    Some(v) if status == "published" => review_for(pool, &[(course, v)])
+      .await?
+      .get(&course)
+      .map(|n| review_clock(published_ms.unwrap_or(0), now, *n).2),
+    _ => None,
+  };
+  Ok(json!({ "ok": true, "checked_ms": now, "due_ms": due }))
+}
+
+/// P6 notices: a current non-guest member who can build courses.
+async fn can_build(pool: &PgPool, ws: Uuid, uid: i64) -> bool {
+  if uid <= 0 {
+    return false;
+  }
+  match carehub_extras::me_in(pool, ws, uid).await {
+    Ok(me) => {
+      let has = |p: &str| me.perms.iter().any(|x| x == p || x == "admin");
+      (me.af_role != guest_role() || has("admin")) && has("learning_build")
+    },
+    Err(_) => false,
+  }
+}
+
+/// P6 notices: one "check this course" reminder that is due.
+struct Check {
+  course: Uuid,
+  ws: Uuid,
+  owner: i64,
+  publisher: i64,
+  kind: &'static str,
+  last_ms: i64,
+  due_ms: i64,
+  checked_ms: i64,
+}
+
+/// P6 notices: "Time to check" messages to course owners (the creator, else
+/// the publisher of the live version, if they can still build courses), once
+/// per due date (claimed first), longest-waiting first, REVIEW_BATCH per run.
+async fn review_reminders(pool: &PgPool) -> Result<(), AppError> {
+  let now = now_ms();
+  // A due is at least 28 days (one month) after the last publish or check.
+  #[allow(clippy::type_complexity)]
+  let rows: Vec<(Uuid, Uuid, i32, i64, i64, i64, i64, i64)> = sqlx::query_as(
+    "SELECT c.id, c.workspace_id, c.published_version, c.created_by, v.published_by, \
+       v.published_ms, COALESCE(r.checked_ms, 0), COALESCE(r.sent_due_ms, 0) \
+     FROM carehub_course c \
+     JOIN carehub_course_version v ON v.course_id = c.id AND v.version = c.published_version \
+     LEFT JOIN carehub_learning_review r ON r.course_id = c.id \
+     WHERE c.status = 'published' AND GREATEST(v.published_ms, COALESCE(r.checked_ms, 0)) <= $1",
+  )
+  .bind(now - 28 * DAY_MS)
+  .fetch_all(pool)
+  .await?;
+  if rows.is_empty() {
+    return Ok(());
+  }
+  let live: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.0, r.2)).collect();
+  let months = review_for(pool, &live).await?;
+  let mut todo: Vec<Check> = Vec::new();
+  for (course, ws, _, created_by, published_by, published_ms, checked_ms, sent_due_ms) in rows {
+    let n = match months.get(&course) {
+      Some(n) => *n,
+      None => continue,
+    };
+    let (kind, last_ms, due_ms) = review_clock(published_ms, checked_ms, n);
+    if now >= due_ms && sent_due_ms != due_ms {
+      todo.push(Check {
+        course,
+        ws,
+        owner: created_by,
+        publisher: published_by,
+        kind,
+        last_ms,
+        due_ms,
+        checked_ms,
+      });
+    }
+  }
+  if todo.is_empty() {
+    return Ok(());
+  }
+  todo.sort_by_key(|x| x.due_ms);
+  todo.truncate(REVIEW_BATCH);
+  let ids: Vec<Uuid> = todo.iter().map(|x| x.course).collect();
+  let titles = titles_of(pool, &ids).await?;
+  for x in &todo {
+    let to = if can_build(pool, x.ws, x.owner).await {
+      Some(x.owner)
+    } else if can_build(pool, x.ws, x.publisher).await {
+      Some(x.publisher)
+    } else {
+      None
+    };
+    // Not claimed: sent already, or marked as checked since we looked.
+    let claimed = sqlx::query(
+      "INSERT INTO carehub_learning_review \
+         (course_id, workspace_id, sent_due_ms, sent_ms, sent_to) \
+       VALUES ($1, $2, $3, $4, $5) \
+       ON CONFLICT (course_id) DO UPDATE SET sent_due_ms = EXCLUDED.sent_due_ms, \
+         sent_ms = EXCLUDED.sent_ms, sent_to = EXCLUDED.sent_to \
+       WHERE carehub_learning_review.sent_due_ms <> EXCLUDED.sent_due_ms \
+         AND carehub_learning_review.checked_ms = $6",
+    )
+    .bind(x.course)
+    .bind(x.ws)
+    .bind(x.due_ms)
+    .bind(now)
+    .bind(to)
+    .bind(x.checked_ms)
+    .execute(pool)
+    .await?;
+    if claimed.rows_affected() == 0 {
+      continue;
+    }
+    let to = match to {
+      Some(uid) => uid,
+      None => {
+        warn_rarely("review reminder: nobody who can build that course is left to tell");
+        continue;
+      },
+    };
+    let title = titles
+      .get(&x.course)
+      .map(|t| t.as_str())
+      .unwrap_or("Untitled course");
+    let what = if x.kind == "checked" {
+      "checked"
+    } else {
+      "updated"
+    };
+    let body = format!(
+      "📅 Time to check “{}”. It was last {} on {}.\n{}",
+      title,
+      what,
+      short_date(x.last_ms, now),
+      web_link(&format!("/app/learning/studio/{}", x.course))
+    );
+    send(pool, to, &body).await;
+  }
+  Ok(())
+}
+
+/// P6 notices: MarkedComplete.
+fn marked_json(by_name: &str, ms: i64, reason: &str) -> Value {
+  json!({ "by_name": by_name, "ms": ms, "reason": reason })
+}
+
+/// P6 notices: people on a course whose current finish was marked by hand
+/// (status completed, the same finish time, not undone).
+async fn marked_on(pool: &PgPool, ws: Uuid, course: Uuid) -> Result<HashMap<i64, Value>, AppError> {
+  let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
+    "SELECT m.uid, m.completed_ms, m.reason, \
+       COALESCE(NULLIF(u.name, ''), split_part(COALESCE(u.email, ''), '@', 1), '') \
+     FROM carehub_learning_manual m \
+     JOIN carehub_enrollment e ON e.course_id = m.course_id AND e.uid = m.uid \
+       AND e.completed_ms = m.completed_ms AND e.status = 'completed' \
+     LEFT JOIN af_user u ON u.uid = m.by_uid \
+     WHERE m.workspace_id = $1 AND m.course_id = $2 AND m.undone_ms IS NULL",
+  )
+  .bind(ws)
+  .bind(course)
+  .fetch_all(pool)
+  .await?;
+  Ok(
+    rows
+      .into_iter()
+      .map(|(uid, ms, reason, by_name)| (uid, marked_json(&by_name, ms, &reason)))
+      .collect(),
+  )
+}
+
+/// P6 notices: "marked" on progress rows (see add_row_expiry): course rows
+/// match on uid, the others (no uid) on their start time; the database is
+/// only asked when a row is completed. A failure leaves the field out.
+async fn add_row_marked(pool: &PgPool, rows: &mut [Value], course: Option<Uuid>) {
+  let mut courses: Vec<Uuid> = Vec::new();
+  let mut times: Vec<i64> = Vec::new();
+  for row in rows.iter() {
+    if txt(row, "status") != "completed" {
+      continue;
+    }
+    let t = row.get("completed_ms").and_then(|x| x.as_i64());
+    if let (Some(c), Some(t)) = (row_course(row, course), t) {
+      courses.push(c);
+      times.push(t);
+    }
+  }
+  #[allow(clippy::type_complexity)]
+  let mut found: Vec<(Uuid, i64, i64, i64, String, String)> = Vec::new();
+  if !courses.is_empty() {
+    if ready(pool).await.is_err() {
+      return;
+    }
+    #[allow(clippy::type_complexity)]
+    let res: Result<Vec<(Uuid, i64, i64, i64, String, String)>, sqlx::Error> = sqlx::query_as(
+      "SELECT m.course_id, m.completed_ms, m.uid, m.started_ms, m.reason, \
+         COALESCE(NULLIF(u.name, ''), split_part(COALESCE(u.email, ''), '@', 1), '') \
+       FROM UNNEST($1::UUID[], $2::BIGINT[]) AS w(course_id, completed_ms) \
+       JOIN carehub_learning_manual m ON m.course_id = w.course_id \
+         AND m.completed_ms = w.completed_ms \
+       LEFT JOIN af_user u ON u.uid = m.by_uid \
+       WHERE m.undone_ms IS NULL",
+    )
+    .bind(courses)
+    .bind(times)
+    .fetch_all(pool)
+    .await;
+    match res {
+      Ok(r) => found = r,
+      Err(err) => {
+        warn_rarely(&format!("marked complete: {}", err));
+        return;
+      },
+    }
+  }
+  for row in rows.iter_mut() {
+    let mut marked = Value::Null;
+    if txt(row, "status") == "completed" {
+      let c = row_course(row, course);
+      let t = row.get("completed_ms").and_then(|x| x.as_i64());
+      let uid = row
+        .get("uid")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<i64>().ok());
+      let started = row.get("started_ms").and_then(|x| x.as_i64());
+      let hit = found.iter().find(|m| {
+        Some(m.0) == c
+          && Some(m.1) == t
+          && match uid {
+            Some(u) => m.2 == u,
+            None => Some(m.3) == started,
+          }
+      });
+      if let Some(m) = hit {
+        marked = marked_json(&m.5, m.1, &m.4);
+      }
+    }
+    if let Some(o) = row.as_object_mut() {
+      o.insert("marked".to_string(), marked);
+    }
+  }
+}
+
+/// P6 notices: POST /assignments/{id}/mark-complete (assign): counts as
+/// finishing the course everywhere. Their progress before (and the renewal
+/// dues the finish will end) is kept so it can be undone.
+async fn mark_complete(
+  state: &AppState,
+  user: &UserUuid,
+  ws: &str,
+  id: &str,
+  body: &[u8],
+) -> Result<Value, AppError> {
+  let c = ctx(state, user, ws).await?;
+  need_assign(&c)?;
+  let asg = parse_uuid(id, ASSIGNMENT_LINK_MSG)?;
+  let body = body_json(body)?;
+  let pool = &state.pg_pool;
+  let by_name = names_of(pool, vec![c.uid()])
+    .await?
+    .remove(&c.uid())
+    .unwrap_or_default();
+  let mut tx = pool.begin().await?;
+  lock_ws(&mut tx, c.ws).await?;
+  let head: Option<(Uuid, String, Option<i32>)> = sqlx::query_as(
+    "SELECT a.course_id, c.status, c.published_version FROM carehub_learning_assignment a \
+     JOIN carehub_course c ON c.id = a.course_id WHERE a.id = $1 AND a.workspace_id = $2",
+  )
+  .bind(asg)
+  .bind(c.ws)
+  .fetch_optional(&mut *tx)
+  .await?;
+  let (course, status, live) = head.ok_or_else(assignment_missing)?;
+  if status == "archived" {
+    return Err(bad(MARK_ARCHIVED_MSG));
+  }
+  let live = match live {
+    Some(v) if status == "published" => v,
+    _ => return Err(bad(MARK_DRAFT_MSG)),
+  };
+  let uid = uid_of(body.get("uid")).ok_or_else(|| bad(PERSON_LINK_MSG))?;
+  let on: bool = sqlx::query_scalar(
+    "SELECT EXISTS (SELECT 1 FROM carehub_learning_assignee s \
+       JOIN af_workspace_member m ON m.workspace_id = $3 AND m.uid = s.uid \
+       JOIN af_user u ON u.uid = s.uid \
+       WHERE s.assignment_id = $1 AND s.uid = $2 AND m.role_id::INT <> $4 \
+         AND COALESCE(u.email, '') NOT LIKE '%.removed-%')",
+  )
+  .bind(asg)
+  .bind(uid)
+  .bind(c.ws)
+  .bind(guest_role())
+  .fetch_one(&mut *tx)
+  .await?;
+  if !on {
+    return Err(bad(NOT_ON_MSG));
+  }
+  let enr: Option<(String, i64, String)> = sqlx::query_as(
+    "SELECT e.status, e.started_ms, to_jsonb(e)::TEXT FROM carehub_enrollment e \
+     WHERE e.course_id = $1 AND e.uid = $2 FOR UPDATE",
+  )
+  .bind(course)
+  .bind(uid)
+  .fetch_optional(&mut *tx)
+  .await?;
+  if enr.as_ref().map(|e| finished(&e.0)).unwrap_or(false) {
+    return Err(bad(DONE_MSG));
+  }
+  let reason = txt(&body, "reason").trim().to_string();
+  if reason.chars().count() > MAX_REASON_CHARS {
+    return Err(bad(REASON_MSG));
+  }
+  let dues: Vec<(Uuid, Option<i64>)> = sqlx::query_as(
+    "SELECT assignment_id, renew_due_ms FROM carehub_learning_assignee \
+     WHERE course_id = $1 AND uid = $2 AND renew_due_ms IS NOT NULL",
+  )
+  .bind(course)
+  .bind(uid)
+  .fetch_all(&mut *tx)
+  .await?;
+  let dues: Vec<Value> = dues
+    .into_iter()
+    .filter_map(|(a, d)| d.map(|d| json!({ "assignment_id": a.to_string(), "renew_due_ms": d })))
+    .collect();
+  // A finish time no other finish on this course has (reports match on it).
+  let now = now_ms();
+  let taken: Vec<i64> = sqlx::query_scalar(
+    "SELECT completed_ms FROM carehub_enrollment \
+     WHERE course_id = $1 AND completed_ms >= $2 AND completed_ms < $3 \
+     UNION SELECT completed_ms FROM carehub_learning_manual \
+     WHERE course_id = $1 AND completed_ms >= $2 AND completed_ms < $3",
+  )
+  .bind(course)
+  .bind(now)
+  .bind(now + 1000)
+  .fetch_all(&mut *tx)
+  .await?;
+  let taken: HashSet<i64> = taken.into_iter().collect();
+  let mut t = now;
+  while taken.contains(&t) {
+    t += 1;
+  }
+  let (from, started_ms, before) = match enr {
+    Some((st, started, snapshot)) => {
+      sqlx::query(
+        "UPDATE carehub_enrollment SET status = 'completed', percent = 100, completed_ms = $3, \
+           last_ms = $3, awaiting_ack = FALSE WHERE course_id = $1 AND uid = $2",
+      )
+      .bind(course)
+      .bind(uid)
+      .bind(t)
+      .execute(&mut *tx)
+      .await?;
+      (st, started, Some(snapshot))
+    },
+    None => {
+      sqlx::query(
+        "INSERT INTO carehub_enrollment \
+           (course_id, uid, version, status, progress, started_ms, last_ms, completed_ms, percent) \
+         VALUES ($1, $2, $3, 'completed', '{}'::jsonb, $4, $4, $4, 100)",
+      )
+      .bind(course)
+      .bind(uid)
+      .bind(live)
+      .bind(t)
+      .execute(&mut *tx)
+      .await?;
+      ("not_started".to_string(), t, None)
+    },
+  };
+  let data = json!({
+    "from": from,
+    "to": "completed",
+    "by": "manual",
+    "by_uid": c.uid().to_string(),
+  });
+  let event = add_event(&mut tx, c.ws, course, uid, "status", &data, t).await?;
+  sqlx::query(
+    "INSERT INTO carehub_learning_manual (course_id, uid, completed_ms, workspace_id, \
+       started_ms, by_uid, reason, before, renew_dues, event_id) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10)",
+  )
+  .bind(course)
+  .bind(uid)
+  .bind(t)
+  .bind(c.ws)
+  .bind(started_ms)
+  .bind(c.uid())
+  .bind(&reason)
+  .bind(before)
+  .bind(Value::Array(dues).to_string())
+  .bind(event)
+  .execute(&mut *tx)
+  .await?;
+  tx.commit().await?;
+  after_change(pool, vec![course]);
+  Ok(json!({
+    "ok": true,
+    "completed_ms": t,
+    "marked": marked_json(&by_name, t, &reason),
+  }))
+}
+
+/// P6 notices: POST /assignments/{id}/undo-complete (assign): while the
+/// hand-marked finish is still their current one, their progress goes back
+/// exactly as it was; that finish's certificate, renewal row and status event
+/// go, and the renewal dues it ended come back.
+async fn undo_complete(
+  state: &AppState,
+  user: &UserUuid,
+  ws: &str,
+  id: &str,
+  body: &[u8],
+) -> Result<Value, AppError> {
+  let c = ctx(state, user, ws).await?;
+  need_assign(&c)?;
+  let asg = parse_uuid(id, ASSIGNMENT_LINK_MSG)?;
+  let body = body_json(body)?;
+  let pool = &state.pg_pool;
+  let mut tx = pool.begin().await?;
+  lock_ws(&mut tx, c.ws).await?;
+  let course: Option<Uuid> = sqlx::query_scalar(
+    "SELECT course_id FROM carehub_learning_assignment WHERE id = $1 AND workspace_id = $2",
+  )
+  .bind(asg)
+  .bind(c.ws)
+  .fetch_optional(&mut *tx)
+  .await?;
+  let course = course.ok_or_else(assignment_missing)?;
+  let uid = uid_of(body.get("uid")).ok_or_else(|| bad(PERSON_LINK_MSG))?;
+  let manual: Option<(i64, Option<String>, String, Option<i64>)> = sqlx::query_as(
+    "SELECT completed_ms, before::TEXT, renew_dues::TEXT, event_id FROM carehub_learning_manual \
+     WHERE course_id = $1 AND uid = $2 AND workspace_id = $3 AND undone_ms IS NULL \
+     ORDER BY completed_ms DESC LIMIT 1 FOR UPDATE",
+  )
+  .bind(course)
+  .bind(uid)
+  .bind(c.ws)
+  .fetch_optional(&mut *tx)
+  .await?;
+  let (t, before, dues, event) = manual.ok_or_else(|| bad(UNDO_MSG))?;
+  let enr: Option<(String, Option<i64>)> = sqlx::query_as(
+    "SELECT status, completed_ms FROM carehub_enrollment \
+     WHERE course_id = $1 AND uid = $2 FOR UPDATE",
+  )
+  .bind(course)
+  .bind(uid)
+  .fetch_optional(&mut *tx)
+  .await?;
+  match enr {
+    Some((st, Some(done))) if st == "completed" && done == t => {},
+    _ => return Err(bad(UNDO_MSG)),
+  }
+  match &before {
+    Some(snapshot) => {
+      sqlx::query(
+        "UPDATE carehub_enrollment e SET version = b.version, status = b.status, \
+           progress = b.progress, score = b.score, attempts = b.attempts, time_ms = b.time_ms, \
+           started_ms = b.started_ms, last_ms = b.last_ms, completed_ms = b.completed_ms, \
+           ack_ms = b.ack_ms, awaiting_ack = b.awaiting_ack, percent = b.percent, \
+           quiz_passed = b.quiz_passed \
+         FROM jsonb_populate_record(NULL::carehub_enrollment, $3::jsonb) AS b \
+         WHERE e.course_id = $1 AND e.uid = $2",
+      )
+      .bind(course)
+      .bind(uid)
+      .bind(snapshot)
+      .execute(&mut *tx)
+      .await?;
+    },
+    None => {
+      sqlx::query("DELETE FROM carehub_enrollment WHERE course_id = $1 AND uid = $2")
+        .bind(course)
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?;
+    },
+  }
+  sqlx::query(
+    "DELETE FROM carehub_learning_certificate WHERE course_id = $1 AND uid = $2 AND issued_ms = $3",
+  )
+  .bind(course)
+  .bind(uid)
+  .bind(t)
+  .execute(&mut *tx)
+  .await?;
+  sqlx::query(
+    "DELETE FROM carehub_learning_renewal WHERE course_id = $1 AND uid = $2 AND finished_ms = $3",
+  )
+  .bind(course)
+  .bind(uid)
+  .bind(t)
+  .execute(&mut *tx)
+  .await?;
+  if let Some(ev) = event {
+    sqlx::query("DELETE FROM carehub_learning_event WHERE id = $1 AND course_id = $2 AND uid = $3")
+      .bind(ev)
+      .bind(course)
+      .bind(uid)
+      .execute(&mut *tx)
+      .await?;
+  }
+  let mut ids: Vec<Uuid> = Vec::new();
+  let mut times: Vec<i64> = Vec::new();
+  if let Ok(Value::Array(list)) = serde_json::from_str::<Value>(&dues) {
+    for d in &list {
+      let due = d.get("renew_due_ms").and_then(|x| x.as_i64());
+      if let (Ok(a), Some(due)) = (Uuid::parse_str(txt(d, "assignment_id")), due) {
+        ids.push(a);
+        times.push(due);
+      }
+    }
+  }
+  if !ids.is_empty() {
+    sqlx::query(
+      "UPDATE carehub_learning_assignee s SET renew_due_ms = w.due \
+       FROM UNNEST($3::UUID[], $4::BIGINT[]) AS w(id, due) \
+       WHERE s.assignment_id = w.id AND s.course_id = $1 AND s.uid = $2 \
+         AND s.renew_due_ms IS NULL",
+    )
+    .bind(course)
+    .bind(uid)
+    .bind(ids)
+    .bind(times)
+    .execute(&mut *tx)
+    .await?;
+  }
+  sqlx::query(
+    "UPDATE carehub_learning_manual SET undone_ms = $4, undone_by = $5 \
+     WHERE course_id = $1 AND uid = $2 AND completed_ms = $3",
+  )
+  .bind(course)
+  .bind(uid)
+  .bind(t)
+  .bind(now_ms())
+  .bind(c.uid())
+  .execute(&mut *tx)
+  .await?;
+  tx.commit().await?;
+  after_change(pool, vec![course]);
+  let snapshot: Value = before
+    .as_deref()
+    .and_then(|s| serde_json::from_str(s).ok())
+    .unwrap_or(Value::Null);
+  let status = match txt(&snapshot, "status") {
+    "" => "not_started",
+    s => s,
+  };
+  Ok(json!({
+    "ok": true,
+    "status": status,
+    "percent": num(&snapshot, "percent", 0),
+  }))
+}
+
+// ---------------------------------------------------------------------------
 // Background task
 // ---------------------------------------------------------------------------
 
@@ -3948,6 +5152,10 @@ async fn tick(pool: &PgPool) -> Result<(), AppError> {
   }
   if let Err(err) = issue_certificates(pool, None, None, None).await {
     warn_rarely(&format!("certificates: {}", err));
+  }
+  // P6 notices: "check this course" reminders.
+  if let Err(err) = review_reminders(pool).await {
+    warn_rarely(&format!("review reminders: {}", err));
   }
   Ok(())
 }
@@ -4105,6 +5313,65 @@ async fn teams_handler(user: UserUuid, state: Data<AppState>, path: web::Path<St
   reply(teams(&state, &user, &ws).await)
 }
 
+/// P6 notices
+async fn announce_info_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(String, String)>,
+) -> Reply {
+  let (ws, id) = path.into_inner();
+  reply(announce_info(&state, &user, &ws, &id).await)
+}
+
+async fn announce_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(String, String)>,
+  body: Bytes,
+) -> Reply {
+  let (ws, id) = path.into_inner();
+  reply(announce(&state, &user, &ws, &id, &body).await)
+}
+
+async fn content_checks_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<String>,
+) -> Reply {
+  let ws = path.into_inner();
+  reply(content_checks(&state, &user, &ws).await)
+}
+
+async fn mark_checked_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(String, String)>,
+  body: Bytes,
+) -> Reply {
+  let (ws, id) = path.into_inner();
+  reply(mark_checked(&state, &user, &ws, &id, &body).await)
+}
+
+async fn mark_complete_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(String, String)>,
+  body: Bytes,
+) -> Reply {
+  let (ws, id) = path.into_inner();
+  reply(mark_complete(&state, &user, &ws, &id, &body).await)
+}
+
+async fn undo_complete_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(String, String)>,
+  body: Bytes,
+) -> Reply {
+  let (ws, id) = path.into_inner();
+  reply(undo_complete(&state, &user, &ws, &id, &body).await)
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
   cfg
     .service(
@@ -4155,6 +5422,28 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/carehub/ws/{ws}/learning/courses/{id}/retake")
         .route(web::post().to(retake_handler)),
+    )
+    // P6 notices
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/studio/{id}/announce")
+        .route(web::get().to(announce_info_handler))
+        .route(web::post().to(announce_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/studio/{id}/mark-checked")
+        .route(web::post().to(mark_checked_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/content-checks")
+        .route(web::get().to(content_checks_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/assignments/{id}/mark-complete")
+        .route(web::post().to(mark_complete_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/assignments/{id}/undo-complete")
+        .route(web::post().to(undo_complete_handler)),
     );
   // P3 paths
   carehub_learning_paths::configure(cfg);

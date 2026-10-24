@@ -6,6 +6,8 @@
 //! what path rows get instead of the per-course messages: one "New learning
 //! path" message per person, reminders for their next course only, and one
 //! calendar entry per person and path.
+//!
+//! P6 notices: GET /paths/{id}/report (each person's state on every course).
 
 use crate::api::carehub_calendar;
 use crate::api::carehub_learning_assign::{self as assign, Asg, Board, Group, Reply, ROW_DUE};
@@ -592,6 +594,83 @@ async fn get_path(
     "path": path_json(&p, &board, &v, &names),
     "courses": courses,
     "targets": targets.into_iter().map(|x| x.1).collect::<Vec<Value>>(),
+    "people": people.into_iter().map(|x| x.1).collect::<Vec<Value>>(),
+  }))
+}
+
+/// P6 notices: GET /paths/{id}/report (build or analytics): everyone on the
+/// path with their state on each course that counts (published now, in path
+/// order); a step's due is their earliest due on that course among the
+/// path's rows.
+async fn path_report(
+  state: &AppState,
+  user: &UserUuid,
+  ws: &str,
+  id: &str,
+) -> Result<Value, AppError> {
+  let c = assign::ctx(state, user, ws).await?;
+  assign::need_reports(&c)?;
+  let id = assign::parse_uuid(id, PATH_LINK_MSG)?;
+  let pool = &state.pg_pool;
+  let mut conn = pool.acquire().await?;
+  let p = one_path(&mut conn, c.ws, id, false).await?;
+  drop(conn);
+  let board = Board::load(pool, c.ws, None).await?;
+  let v = view(&board, &p);
+  let mut dues: HashMap<(i64, Uuid), i64> = HashMap::new();
+  for a in board.asgs.iter().filter(|a| a.path == Some(p.id)) {
+    for uid in board.rows.get(&a.id).into_iter().flatten() {
+      if let Some((_, Some(due))) = board.seats.get(&(a.id, *uid)) {
+        let best = dues.entry((*uid, a.course)).or_insert(*due);
+        *best = (*best).min(*due);
+      }
+    }
+  }
+  let courses: Vec<Value> = v
+    .steps
+    .iter()
+    .map(|cid| json!({ "course_id": cid.to_string(), "title": course_title(&board, *cid) }))
+    .collect();
+  let mut people: Vec<(String, Value)> = v
+    .members
+    .iter()
+    .filter_map(|(uid, m)| {
+      let person = board.people.get(*uid)?;
+      let steps: Vec<Value> = v
+        .steps
+        .iter()
+        .map(|cid| {
+          let e = board.enr.get(&(*cid, *uid));
+          let status = e.map(|x| x.status.as_str()).unwrap_or("not_started");
+          let done = assign::finished(status);
+          let due = dues.get(&(*uid, *cid)).copied();
+          json!({
+            "course_id": cid.to_string(),
+            "status": status,
+            "percent": e.map(|x| x.percent).unwrap_or(0),
+            "completed_ms": e.and_then(|x| x.completed_ms).filter(|_| done),
+            "due_ms": due,
+            "overdue": !done && due.map(|d| d < board.now).unwrap_or(false),
+          })
+        })
+        .collect();
+      let mut row = person_json(*uid, person, m, &board, &v.steps);
+      if let Some(o) = row.as_object_mut() {
+        o.remove("next");
+        o.insert("steps".to_string(), Value::Array(steps));
+      }
+      Some((person.name.to_lowercase(), row))
+    })
+    .collect();
+  people.sort_by(|a, b| a.0.cmp(&b.0));
+  Ok(json!({
+    "path": {
+      "id": p.id.to_string(),
+      "title": p.title,
+      "in_order": p.in_order,
+      "archived": p.archived,
+    },
+    "courses": courses,
     "people": people.into_iter().map(|x| x.1).collect::<Vec<Value>>(),
   }))
 }
@@ -1525,6 +1604,16 @@ async fn get_handler(
   assign::reply(get_path(&state, &user, &ws, &id).await)
 }
 
+/// P6 notices
+async fn report_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(String, String)>,
+) -> Reply {
+  let (ws, id) = path.into_inner();
+  assign::reply(path_report(&state, &user, &ws, &id).await)
+}
+
 async fn update_handler(
   user: UserUuid,
   state: Data<AppState>,
@@ -1588,5 +1677,10 @@ pub(crate) fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/carehub/ws/{ws}/learning/paths/{id}/unassign")
         .route(web::post().to(unassign_handler)),
+    )
+    // P6 notices
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/paths/{id}/report")
+        .route(web::get().to(report_handler)),
     );
 }

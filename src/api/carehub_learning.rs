@@ -37,6 +37,12 @@ const HEARTBEAT_CAP_MS: i64 = 60_000;
 const QUIZ_LESSON: &str = "_quiz";
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_KC_BYTES: usize = 20_000;
+/// blocks4 (player4 P3 / P5 / P6): publish limits for button and label words,
+/// lesson icons and topics, counted in characters (code points), like the web.
+const MAX_LABEL_CHARS: usize = 40;
+const MAX_ICON_CHARS: usize = 8;
+const MAX_TAGS: usize = 10;
+const MAX_TAG_CHARS: usize = 30;
 const TABLE_LOCK_KEY: i64 = 7_316_402_219;
 
 const GUEST_MSG: &str = "Courses aren't available for guest accounts yet.";
@@ -1834,13 +1840,15 @@ async fn course_cards(
 ) -> Result<Value, AppError> {
   let c = ctx(state, user, ws).await?;
   // Card details come from the version the caller is on (or the latest one).
+  // blocks4: side lessons (`branch: true`) aren't counted in `lessons` (like /assigned).
   let cards: Vec<CardRow> = sqlx::query_as(
     "SELECT c.id, c.status, v.published_ms, v.version, \
        COALESCE(NULLIF(BTRIM(v.content->>'title'), ''), NULLIF(c.title, ''), 'Untitled course'), \
        COALESCE(v.content->>'summary', ''), COALESCE(v.content->>'cover', ''), \
        COALESCE(v.content->>'preset', 'standard'), \
-       (CASE WHEN jsonb_typeof(v.content->'lessons') = 'array' \
-         THEN jsonb_array_length(v.content->'lessons') ELSE 0 END)::INT, \
+       (SELECT COUNT(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(v.content->'lessons') \
+         = 'array' THEN v.content->'lessons' ELSE '[]'::jsonb END) AS x \
+         WHERE x->'branch' IS DISTINCT FROM 'true'::jsonb)::INT, \
        (CASE WHEN jsonb_typeof(v.content->'est_minutes') = 'number' \
          THEN LEAST(GREATEST((v.content->>'est_minutes')::NUMERIC, 0), 100000) ELSE 0 END)::INT, \
        (COALESCE(v.content->'quiz'->>'enabled', 'false') = 'true' \
@@ -1900,7 +1908,75 @@ async fn course_cards(
   let mut courses: Vec<Value> = picked.iter().map(|(card, my)| card_json(card, *my)).collect();
   // P2 recert
   carehub_learning_assign::add_card_expiry(&state.pg_pool, &mut courses).await;
+  // blocks4 (P6 topics)
+  add_card_tags(&state.pg_pool, &mut courses).await;
   Ok(json!({ "courses": courses }))
+}
+
+/// blocks4 (P6 topics): every card gets `tags` from the version it shows,
+/// looked up by (course id, version) like add_card_expiry, so CardRow stays as
+/// it is. Strings only, trimmed, 1 to 30 characters, 10 at most; missing = [].
+/// If the lookup fails it's logged and the cards get [] (the page still loads).
+/// pub(crate) so other card lists (e.g. /assigned) can add topics the same way.
+pub(crate) async fn add_card_tags(pool: &PgPool, cards: &mut [Value]) {
+  let mut keys: Vec<(Uuid, i32)> = cards.iter().filter_map(card_key).collect();
+  keys.sort();
+  keys.dedup();
+  let mut found: HashMap<(Uuid, i32), Vec<Value>> = HashMap::new();
+  if !keys.is_empty() {
+    let (ids, versions): (Vec<Uuid>, Vec<i32>) = keys.iter().copied().unzip();
+    let rows: Vec<(Uuid, i32, Option<String>)> = sqlx::query_as(
+      "SELECT v.course_id, v.version, (v.content->'settings'->'tags')::TEXT \
+       FROM carehub_course_version v \
+       JOIN UNNEST($1::UUID[], $2::INT[]) AS w(course_id, version) \
+         ON w.course_id = v.course_id AND w.version = v.version",
+    )
+    .bind(ids)
+    .bind(versions)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|err| {
+      tracing::warn!("carehub learning: card topics: {}", err);
+      Vec::new()
+    });
+    for (id, version, raw) in rows {
+      let value: Value = raw
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+      found.insert((id, version), card_tags(&value));
+    }
+  }
+  for card in cards.iter_mut() {
+    let tags = card_key(card)
+      .and_then(|key| found.get(&key).cloned())
+      .unwrap_or_default();
+    if let Some(m) = card.as_object_mut() {
+      m.insert("tags".to_string(), Value::Array(tags));
+    }
+  }
+}
+
+/// A card's (course id, version), as card_json writes them.
+fn card_key(card: &Value) -> Option<(Uuid, i32)> {
+  let id = Uuid::parse_str(txt(card, "id")).ok()?;
+  let version = i32::try_from(card.get("version")?.as_i64()?).ok()?;
+  Some((id, version))
+}
+
+/// blocks4 (P6 topics): the topics a card shows, from `settings.tags`.
+fn card_tags(raw: &Value) -> Vec<Value> {
+  let items: &[Value] = match raw.as_array() {
+    Some(a) => a.as_slice(),
+    None => &[],
+  };
+  items
+    .iter()
+    .filter_map(|t| t.as_str())
+    .map(str::trim)
+    .filter(|t| !t.is_empty() && t.chars().count() <= MAX_TAG_CHARS)
+    .take(MAX_TAGS)
+    .map(|t| Value::String(t.to_string()))
+    .collect()
 }
 
 /// GET /courses/{id}/play
@@ -3168,10 +3244,32 @@ fn check_block(b: &Value, at: &str, problems: &mut Vec<String>) {
         problems.push(format!("{} has a marker without a title.", who));
       }
     },
+    // blocks4: a quote's photo, and every carousel quote's, follows the image
+    // link rule (one sentence per block, like the web).
+    "quote" | "quote_carousel" => {
+      let bad = if kind == "quote" {
+        quote_photo_bad(b)
+      } else {
+        list(b, "quotes").iter().any(quote_photo_bad)
+      };
+      if bad {
+        problems.push(format!(
+          "The quote picture link in {} must start with https:// (or be a Care Hub link \
+           starting with /).",
+          at
+        ));
+      }
+    },
     _ => {},
   }
   // qbank3: video captions and transcripts, and the newer block kinds.
   qbank::check_block_extra(b, at, problems);
+}
+
+/// blocks4: a quote photo link that's there (trimmed) but isn't allowed.
+fn quote_photo_bad(quote: &Value) -> bool {
+  let url = txt(quote, "image_url").trim();
+  !url.is_empty() && !url_ok(url)
 }
 
 /// Everything that stops a draft from being published, one sentence each.
@@ -3199,6 +3297,31 @@ fn publish_problems(c: &Value, size: usize) -> Vec<String> {
     Some(v) if v.is_object() => v,
     _ => &empty,
   };
+  // blocks4 (player4 P3 button and label words, P6 topics), right after the
+  // cover link check like the web. Non-strings are ignored.
+  let long_word = match st.get("labels").and_then(|x| x.as_object()) {
+    Some(words) => words
+      .values()
+      .filter_map(|w| w.as_str())
+      .any(|w| w.trim().chars().count() > MAX_LABEL_CHARS),
+    None => false,
+  };
+  if long_word {
+    problems.push(
+      "One of the button and label words is too long (40 characters at most).".to_string(),
+    );
+  }
+  let tags: Vec<&str> = list(st, "tags").iter().filter_map(|t| t.as_str()).collect();
+  if tags.len() > MAX_TAGS {
+    problems.push("A course can have up to 10 topics.".to_string());
+  }
+  let bad_tag = tags.iter().any(|t| {
+    let t = t.trim();
+    t.is_empty() || t.chars().count() > MAX_TAG_CHARS || t.contains(',')
+  });
+  if bad_tag {
+    problems.push("Each topic must be 1 to 30 characters, with no commas.".to_string());
+  }
   if !(0_i64..=100).contains(&num(st, "pass_mark", 80)) {
     problems.push("Set the pass mark between 0 and 100.".to_string());
   }
@@ -3230,6 +3353,18 @@ fn publish_problems(c: &Value, size: usize) -> Vec<String> {
     let blocks = list(lesson, "blocks");
     if blocks.is_empty() {
       problems.push(format!("{} needs at least one block.", name));
+    }
+    // blocks4 (player4 P5): the lesson's header picture and icon.
+    let header = txt(lesson, "header_image").trim();
+    if !header.is_empty() && !url_ok(header) {
+      problems.push(format!(
+        "The header picture link in {} must start with https:// (or be a Care Hub link \
+         starting with /).",
+        name
+      ));
+    }
+    if txt(lesson, "icon").trim().chars().count() > MAX_ICON_CHARS {
+      problems.push(format!("The icon in {} is too long (8 characters at most).", name));
     }
     for (bi, block) in blocks.iter().enumerate() {
       let at = format!("block {} of {}", bi + 1, name);

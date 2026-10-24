@@ -10,6 +10,7 @@
 //! `learning_analytics`. `admin` implies both.
 
 use crate::api::carehub_extras::{me_in, Me};
+use crate::api::carehub_learning_bank as qbank; // qbank3: hooks below
 use crate::biz::authentication::jwt::UserUuid;
 use crate::state::AppState;
 use actix_web::web::{self, Bytes, Data, Json};
@@ -403,7 +404,8 @@ fn mix(mut z: u64) -> u64 {
   z ^ (z >> 31)
 }
 
-fn shuffle<T>(items: &mut [T], seed: &str) {
+// qbank3: pub(crate) for the question bank draws.
+pub(crate) fn shuffle<T>(items: &mut [T], seed: &str) {
   let mut state = fnv(seed);
   let n = items.len();
   if n < 2 {
@@ -1290,12 +1292,20 @@ fn pick_questions<'a>(
     Some(q) => list(q, "questions"),
     None => &[],
   };
-  let mut idx: Vec<usize> = (0..all.len()).collect();
-  if st.pool_size > 0 && st.pool_size < all.len() {
+  // qbank3: the pool is taken from the quiz's own questions; questions copied
+  // from question banks are drawn on top (the same as before without them).
+  let mut idx: Vec<usize> = all
+    .iter()
+    .enumerate()
+    .filter(|(_, q)| !qbank::from_bank(q))
+    .map(|(i, _)| i)
+    .collect();
+  if st.pool_size > 0 && st.pool_size < idx.len() {
     shuffle(&mut idx, &format!("{}:{}:{}:pool", course, uid, attempt));
     idx.truncate(st.pool_size);
     idx.sort_unstable();
   }
+  idx.extend(qbank::drawn(all, content, course, uid, attempt));
   if st.shuffle {
     shuffle(&mut idx, &format!("{}:{}:{}:order", course, uid, attempt));
   }
@@ -1357,6 +1367,8 @@ fn public_question(q: &Value, course: Uuid) -> Value {
     match kind {
       "fill_blank" => {
         o.insert("blank".to_string(), json!(true));
+        // qbank3: so the review can say "Capital letters count."
+        o.insert("case_sensitive".to_string(), json!(flag(q, "case_sensitive", false)));
       },
       "ordering" => {
         o.insert("items".to_string(), Value::Array(shuffled_items(q, course)));
@@ -1684,6 +1696,9 @@ async fn play(state: &AppState, user: &UserUuid, ws: &str, id: &str) -> Result<V
     o.insert("attempts_used".to_string(), json!(used));
     o.insert("attempts_left".to_string(), json!(attempts_left(&st, used)));
     o.insert("locked_reason".to_string(), json!(locked));
+    // qbank3: learners don't get the bank rows or the draft checksum.
+    o.remove("draws");
+    o.remove("draft_md5");
   }
   let mut out = content;
   if let Some(o) = out.as_object_mut() {
@@ -1697,6 +1712,9 @@ async fn play(state: &AppState, user: &UserUuid, ws: &str, id: &str) -> Result<V
     "enrollment".to_string(),
     enr.as_ref().map(|e| e.full_json()).unwrap_or(Value::Null),
   );
+  // qbank3: the caller's own survey answers ({} if none).
+  let surveys = qbank::my_surveys(&state.pg_pool, course, uid).await;
+  res.insert("surveys".to_string(), surveys);
   Ok(Value::Object(res))
 }
 
@@ -1823,6 +1841,32 @@ async fn progress(
         let entry = json!({ "answer": answer, "correct": correct, "ms": ts });
         data = Some(entry.to_string());
         enr.prog.kc.insert(block_id.to_string(), entry);
+      },
+      // qbank3: survey answers are saved in their own table and never go to
+      // the event log; a saved set also counts the block as done.
+      "survey_answer" => {
+        let saved = qbank::save_survey(
+          &mut tx,
+          &state.pg_pool,
+          c.ws,
+          course,
+          c.uid(),
+          enr.version,
+          lesson,
+          block_id,
+          ev.get("data"),
+          now,
+        )
+        .await?;
+        if let Some(reason) = saved {
+          rejected.push(json!({ "i": i, "reason": reason }));
+        } else {
+          let lp = enr.prog.lessons.entry(lesson_id.to_string()).or_default();
+          if !lp.blocks_done.iter().any(|b| b == block_id) {
+            lp.blocks_done.push(block_id.to_string());
+          }
+        }
+        continue;
       },
       "lesson_complete" => {
         if enr.prog.lesson_done(lesson_id) {
@@ -1977,6 +2021,11 @@ async fn submit_quiz(
     if reveal {
       r.insert("correct_answer".to_string(), correct_answer(q, course));
       r.insert("explanation".to_string(), json!(txt(q, "explanation")));
+      // qbank3: the picked options' own feedback.
+      let given = answers.get(txt(q, "id")).unwrap_or(&null);
+      if let Some(picked) = qbank::option_feedback(q, given) {
+        r.insert("option_feedback".to_string(), picked);
+      }
     }
     results.push(Value::Object(r));
     kept.push(json!({ "question_id": txt(q, "id"), "correct": *ok, "earned": got, "points": *pts }));
@@ -2109,12 +2158,15 @@ fn default_content(title: &str, preset: &str) -> Value {
 async fn studio_list(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, AppError> {
   let c = ctx(state, user, ws).await?;
   c.need_build()?;
+  // qbank3: a version with bank copies is compared through its draft checksum.
   let rows: Vec<(Uuid, String, String, Option<i32>, i64, String, String, bool, i64, i64)> =
     sqlx::query_as(
       "SELECT c.id, c.title, c.status, c.published_version, c.updated_ms, \
          COALESCE(NULLIF(uu.name, ''), split_part(COALESCE(uu.email, ''), '@', 1), ''), \
          COALESCE(NULLIF(cu.name, ''), split_part(COALESCE(cu.email, ''), '@', 1), ''), \
-         COALESCE(c.published_version IS NULL OR v.content IS NULL OR c.draft <> v.content, TRUE), \
+         COALESCE(c.published_version IS NULL OR v.content IS NULL OR CASE \
+           WHEN v.content->'quiz'->>'draft_md5' IS NULL THEN c.draft <> v.content \
+           ELSE md5(c.draft::text) <> v.content->'quiz'->>'draft_md5' END, TRUE), \
          (SELECT COUNT(*) FROM carehub_enrollment e WHERE e.course_id = c.id)::BIGINT, \
          (SELECT COUNT(*) FROM carehub_enrollment e \
            WHERE e.course_id = c.id AND e.status IN ('completed', 'passed'))::BIGINT \
@@ -2208,9 +2260,12 @@ async fn studio_get(
   let c = ctx(state, user, ws).await?;
   c.need_build()?;
   let course = parse_uuid(id, COURSE_LINK_MSG)?;
+  // qbank3: a version with bank copies is compared through its draft checksum.
   let row: Option<(String, String, i64, Option<i32>, bool)> = sqlx::query_as(
     "SELECT c.status, c.draft::text, c.draft_updated_ms, c.published_version, \
-       COALESCE(c.published_version IS NULL OR v.content IS NULL OR c.draft <> v.content, TRUE) \
+       COALESCE(c.published_version IS NULL OR v.content IS NULL OR CASE \
+         WHEN v.content->'quiz'->>'draft_md5' IS NULL THEN c.draft <> v.content \
+         ELSE md5(c.draft::text) <> v.content->'quiz'->>'draft_md5' END, TRUE) \
      FROM carehub_course c \
      LEFT JOIN carehub_course_version v ON v.course_id = c.id AND v.version = c.published_version \
      WHERE c.id = $1 AND c.workspace_id = $2",
@@ -2326,7 +2381,11 @@ async fn studio_publish(
   .await?;
   let (text,) = row.ok_or_else(missing)?;
   let draft: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-  let problems = publish_problems(&draft, text.len());
+  // qbank3: copy the drawn question banks' questions into the version.
+  let frozen = qbank::freeze_draws(&mut tx, &state.pg_pool, c.ws, &draft).await?;
+  let checked = frozen.content.as_ref().unwrap_or(&draft);
+  let mut problems = publish_problems(checked, text.len().max(frozen.text.len()));
+  problems.extend(frozen.problems.iter().cloned());
   if !problems.is_empty() {
     return Err(bad(&problem_sentence(&problems)));
   }
@@ -2337,17 +2396,22 @@ async fn studio_publish(
   .fetch_one(&mut *tx)
   .await?;
   let now = now_ms();
-  sqlx::query(
-    "INSERT INTO carehub_course_version (course_id, version, content, note, published_by, published_ms) \
-     SELECT id, $2, draft, $3, $4, $5 FROM carehub_course WHERE id = $1",
-  )
-  .bind(course)
-  .bind(next)
-  .bind(note)
-  .bind(c.uid())
-  .bind(now)
-  .execute(&mut *tx)
-  .await?;
+  // qbank3: a version with bank copies is stored from the frozen content.
+  if frozen.content.is_some() {
+    qbank::insert_frozen(&mut tx, course, next, &note, c.uid(), now, &frozen.text).await?;
+  } else {
+    sqlx::query(
+      "INSERT INTO carehub_course_version (course_id, version, content, note, published_by, published_ms) \
+       SELECT id, $2, draft, $3, $4, $5 FROM carehub_course WHERE id = $1",
+    )
+    .bind(course)
+    .bind(next)
+    .bind(note)
+    .bind(c.uid())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+  }
   sqlx::query(
     "UPDATE carehub_course SET status = 'published', published_version = $2, title = $3, \
        updated_ms = $4, updated_by = $5 WHERE id = $1",
@@ -2566,7 +2630,8 @@ async fn studio_delete(
 // Publish checks
 // ---------------------------------------------------------------------------
 
-fn url_ok(raw: &str) -> bool {
+// qbank3: pub(crate) for the bank module's checks.
+pub(crate) fn url_ok(raw: &str) -> bool {
   // S4: no control characters (U+0000-U+001F, U+007F) anywhere. Browsers drop
   // tabs and line breaks, so "/<tab>/host" would open another website.
   if raw.bytes().any(|b| b.is_ascii_control()) {
@@ -2626,7 +2691,8 @@ fn embed_ok(raw: &str) -> bool {
   !lower.contains('@') && !host.contains(':') && EMBED_HOSTS.contains(&host)
 }
 
-fn lesson_name(index: usize, lesson: &Value) -> String {
+// qbank3: pub(crate) for the bank module's link check.
+pub(crate) fn lesson_name(index: usize, lesson: &Value) -> String {
   let title = txt(lesson, "title").trim();
   if title.is_empty() {
     format!("Lesson {}", index + 1)
@@ -2757,6 +2823,8 @@ fn check_question(q: &Value, label: &str, problems: &mut Vec<String>) {
     },
     _ => problems.push(format!("{} has an unknown question type.", label)),
   }
+  // qbank3: feedback for each answer.
+  qbank::check_question_extra(q, label, problems);
 }
 
 fn check_block(b: &Value, at: &str, problems: &mut Vec<String>) {
@@ -2843,6 +2911,8 @@ fn check_block(b: &Value, at: &str, problems: &mut Vec<String>) {
     },
     _ => {},
   }
+  // qbank3: video captions and transcripts, and the newer block kinds.
+  qbank::check_block_extra(b, at, problems);
 }
 
 /// Everything that stops a draft from being published, one sentence each.
@@ -2911,6 +2981,8 @@ fn publish_problems(c: &Value, size: usize) -> Vec<String> {
       check_block(block, &at, &mut problems);
     }
   }
+  // qbank3: buttons and text links must go to a lesson or block of this course.
+  qbank::link_problems(c, &mut problems);
   let quiz = match c.get("quiz") {
     Some(v) if v.is_object() => v,
     _ => &empty,
@@ -2921,15 +2993,22 @@ fn publish_problems(c: &Value, size: usize) -> Vec<String> {
       problems.push("Add at least one quiz question, or turn the quiz off.".to_string());
     }
     let pool = num(quiz, "pool_size", 0);
-    if pool < 0 || pool > questions.len() as i64 {
+    // qbank3: the pool counts the quiz's own questions only (not bank copies).
+    let own = questions.iter().filter(|q| !qbank::from_bank(q)).count();
+    if pool < 0 || pool > own as i64 {
       problems.push(
         "The quiz can't ask more questions than it has. Lower the number of questions to ask."
           .to_string(),
       );
     }
     let mut question_ids: HashSet<&str> = HashSet::new();
+    // qbank3: bank copies are labelled `Question {k} in “{bank}”`.
+    let labels = qbank::question_labels(quiz);
     for (qi, q) in questions.iter().enumerate() {
-      let label = format!("Quiz question {}", qi + 1);
+      let label = match labels.get(qi) {
+        Some(l) => l.clone(),
+        None => format!("Quiz question {}", qi + 1),
+      };
       let qid = txt(q, "id").trim();
       if qid.is_empty() || !question_ids.insert(qid) {
         problems.push(format!(
@@ -3647,4 +3726,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
       web::resource("/api/carehub/ws/{ws}/learning/reports/overview")
         .route(web::get().to(crate::api::carehub_learning_overview::overview_handler)),
     );
+  // qbank3: question banks and survey results.
+  qbank::configure(cfg);
 }

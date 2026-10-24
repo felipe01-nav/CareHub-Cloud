@@ -14,6 +14,7 @@ pub mod carehub_learning_assign;
 pub mod carehub_learning_bank;
 pub mod carehub_learning_drafts;
 pub mod carehub_learning_overview;
+pub mod carehub_learning_paths;
 pub mod carehub_messages;
 pub mod chat;
 pub mod data_import;

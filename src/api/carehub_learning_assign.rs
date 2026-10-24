@@ -11,10 +11,16 @@
 //! nothing is sent twice), keeps due-date calendar entries in step and issues
 //! certificates. Request handlers run the same reminder / calendar pass for
 //! the courses they touched, right after they commit.
+//!
+//! Lane paths3 (hunks marked P1 due_days / P2 recert / P3 paths): due "N
+//! days after they're added", renewal of finishes after N months (heads-up,
+//! progress reset, renewal due) and the assignment side of learning paths
+//! (carehub_learning_paths.rs).
 
 use crate::api::carehub_calendar;
 use crate::api::carehub_extras;
 use crate::api::carehub_learning::{self, CardRow, Ctx, MyRow};
+use crate::api::carehub_learning_paths;
 use crate::biz::authentication::jwt::UserUuid;
 use crate::state::AppState;
 use actix_web::web::{self, Bytes, Data, Json};
@@ -33,13 +39,15 @@ static READY: AtomicBool = AtomicBool::new(false);
 static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
 /// settings.certificate per published version (versions never change).
 static CERT_FLAGS: Mutex<BTreeMap<(Uuid, i32), bool>> = Mutex::new(BTreeMap::new());
+/// P2 recert: settings.recert_months per published version (None = never).
+static RECERT: Mutex<BTreeMap<(Uuid, i32), Option<i64>>> = Mutex::new(BTreeMap::new());
 
 const TABLE_LOCK_KEY: i64 = 7_316_402_220;
 const WS_LOCK_CLASS: i32 = 7_316_403;
-const DAY_MS: i64 = 86_400_000;
-const HOUR_MS: i64 = 3_600_000;
+pub(crate) const DAY_MS: i64 = 86_400_000;
+pub(crate) const HOUR_MS: i64 = 3_600_000;
 /// Reminders go out at 09:00 in the assignment's time zone.
-const REMIND_HOUR: i64 = 9;
+pub(crate) const REMIND_HOUR: i64 = 9;
 const MAX_TARGETS: usize = 200;
 const MAX_NOTE_CHARS: usize = 500;
 const MAX_GROUP_NAME_CHARS: usize = 80;
@@ -49,7 +57,19 @@ const MAX_GROUP_PEOPLE: usize = 1000;
 const MAX_DUE_MS: i64 = 7_258_118_400_000;
 const TICK_PAIRS: i64 = 500;
 const CERT_BATCH: i64 = 500;
-const CALENDAR_BATCH: usize = 1000;
+pub(crate) const CALENDAR_BATCH: usize = 1000;
+/// P1 due_days: "due N days after they're added", N = 1-365.
+const MAX_DUE_DAYS: i64 = 365;
+/// P2 recert: heads-ups / renewals handled per run (the rest wait a minute).
+const RENEW_BATCH: i64 = 200;
+/// P2 recert: a finish of someone who isn't assigned is looked at again after this.
+const RECHECK_MS: i64 = 600_000;
+const MAX_RECERT_MONTHS: i64 = 60;
+/// P2 recert: days from the heads-up to the day a finish runs out (1-month
+/// renewals: 7), and from a renewal to its due.
+const HEADS_UP_DAYS: i64 = 30;
+const HEADS_UP_DAYS_MONTHLY: i64 = 7;
+const RENEW_DAYS: i64 = 30;
 const QUIZ_ATTEMPTS_CAP: i64 = 5000;
 /// No 0/O/1/I/L, so codes can be read out and typed without mistakes.
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -57,7 +77,7 @@ const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const SETUP_MSG: &str = "Learning is still being set up. Please try again in a minute.";
 const SERVER_MSG: &str = "Something went wrong on the server. Please try again in a moment.";
 const BODY_MSG: &str = "That request couldn't be read. Please reload the page and try again.";
-const COURSE_LINK_MSG: &str = "That course link doesn't look right.";
+pub(crate) const COURSE_LINK_MSG: &str = "That course link doesn't look right.";
 const MISSING_MSG: &str = "That course couldn't be found. It may have been deleted.";
 const ASSIGN_MSG: &str =
   "You need the \"Assign courses\" permission for this. Ask an admin to update your role.";
@@ -81,6 +101,19 @@ const TOO_MANY_TARGETS_MSG: &str = "You can assign to up to 200 people, roles or
 const UNKNOWN_TARGETS_MSG: &str =
   "Those people, roles or groups couldn't be found. Please reload the page and try again.";
 const CERT_MISSING_MSG: &str = "We couldn't find a certificate with that code.";
+// P1 due_days
+const BOTH_DUE_MSG: &str = "Pick a due date or a number of days, not both.";
+const DAYS_MSG: &str = "Pick a number of days between 1 and 365.";
+// P2 recert
+const RETAKE_MSG: &str = "You can take this course again once it runs out.";
+const RECERT_MSG: &str = "Renewal must be between 1 and 60 months (or leave it empty).";
+
+/// P1 due_days / P2 recert: the due of one person's row (s = assignee, a =
+/// assignment) in SQL: a renewal due, else 23:59:59.999 local on the day N
+/// days after they were added (or N was set), else the date. Twin: seat_due.
+pub(crate) const ROW_DUE: &str = "COALESCE(s.renew_due_ms, CASE WHEN a.due_days IS NULL \
+  THEN a.due_ms ELSE ((GREATEST(s.assigned_ms, a.days_from_ms) + a.tz_minutes::BIGINT * 60000) \
+  / 86400000 + a.due_days + 1) * 86400000 - a.tz_minutes::BIGINT * 60000 - 1 END)";
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = [
@@ -133,6 +166,50 @@ const TABLES: &[&str] = &[
      course_id UUID NOT NULL, uid BIGINT NOT NULL, workspace_id UUID NOT NULL, \
      event_id UUID NOT NULL, start_ms BIGINT NOT NULL, updated_ms BIGINT NOT NULL DEFAULT 0, \
      PRIMARY KEY (course_id, uid))",
+  // P3 paths (the table first: assignments point at it)
+  "CREATE TABLE IF NOT EXISTS carehub_learning_path (\
+     id UUID PRIMARY KEY, workspace_id UUID NOT NULL, title TEXT NOT NULL, \
+     description TEXT NOT NULL DEFAULT '', course_ids UUID[] NOT NULL DEFAULT '{}', \
+     in_order BOOLEAN NOT NULL DEFAULT TRUE, archived BOOLEAN NOT NULL DEFAULT FALSE, \
+     created_by BIGINT NOT NULL DEFAULT 0, created_ms BIGINT NOT NULL DEFAULT 0, \
+     updated_ms BIGINT NOT NULL DEFAULT 0)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS carehub_learning_path_title \
+     ON carehub_learning_path (workspace_id, LOWER(title))",
+  "CREATE TABLE IF NOT EXISTS carehub_learning_path_calendar (\
+     path_id UUID NOT NULL, uid BIGINT NOT NULL, workspace_id UUID NOT NULL, \
+     event_id UUID NOT NULL, start_ms BIGINT NOT NULL, updated_ms BIGINT NOT NULL DEFAULT 0, \
+     PRIMARY KEY (path_id, uid))",
+  // P1 due_days
+  "ALTER TABLE carehub_learning_assignment ADD COLUMN IF NOT EXISTS due_days INT",
+  "ALTER TABLE carehub_learning_assignment \
+     ADD COLUMN IF NOT EXISTS days_from_ms BIGINT NOT NULL DEFAULT 0",
+  // P3 paths: null = a direct assignment.
+  "ALTER TABLE carehub_learning_assignment ADD COLUMN IF NOT EXISTS path_id UUID \
+     REFERENCES carehub_learning_path (id) ON DELETE CASCADE",
+  "CREATE INDEX IF NOT EXISTS carehub_learning_assignment_path \
+     ON carehub_learning_assignment (path_id)",
+  // P3 paths: one direct assignment per course + target, and one per path. The
+  // index keeps its name, so an older build's CREATE IF NOT EXISTS is a no-op.
+  "DO $$ BEGIN \
+     IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() \
+       AND indexname = 'carehub_learning_assignment_target' AND indexdef LIKE '%path_id%') THEN \
+       DROP INDEX IF EXISTS carehub_learning_assignment_target; \
+       CREATE UNIQUE INDEX carehub_learning_assignment_target ON carehub_learning_assignment \
+         (course_id, target_kind, target_id, \
+          COALESCE(path_id, '00000000-0000-0000-0000-000000000000'::UUID)); \
+     END IF; \
+   END $$",
+  // P2 recert
+  "ALTER TABLE carehub_learning_assignee ADD COLUMN IF NOT EXISTS renew_due_ms BIGINT",
+  "CREATE INDEX IF NOT EXISTS carehub_learning_assignee_renew \
+     ON carehub_learning_assignee (course_id, uid) WHERE renew_due_ms IS NOT NULL",
+  "CREATE TABLE IF NOT EXISTS carehub_learning_renewal (\
+     course_id UUID NOT NULL REFERENCES carehub_course (id) ON DELETE CASCADE, \
+     uid BIGINT NOT NULL, finished_ms BIGINT NOT NULL, workspace_id UUID NOT NULL, \
+     months BIGINT NOT NULL DEFAULT 0, expires_ms BIGINT NOT NULL DEFAULT 0, \
+     wake_ms BIGINT NOT NULL DEFAULT 0, heads_up_ms BIGINT NOT NULL DEFAULT 0, \
+     renewed_ms BIGINT NOT NULL DEFAULT 0, due_ms BIGINT, \
+     PRIMARY KEY (course_id, uid, finished_ms))",
 ];
 
 /// Creates the Phase 2 tables once (after the Phase 1 ones they point at).
@@ -169,9 +246,9 @@ async fn create_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-type Reply = ActixResult<Json<AppResponse<Value>>>;
+pub(crate) type Reply = ActixResult<Json<AppResponse<Value>>>;
 
-fn reply(result: Result<Value, AppError>) -> Reply {
+pub(crate) fn reply(result: Result<Value, AppError>) -> Reply {
   match result {
     Ok(data) => Ok(Json(AppResponse::Ok().with_data(data))),
     Err(err) => Err(tidy(err).into()),
@@ -192,7 +269,7 @@ fn tidy(err: AppError) -> AppError {
   }
 }
 
-fn bad(msg: &str) -> AppError {
+pub(crate) fn bad(msg: &str) -> AppError {
   AppError::InvalidRequest(msg.to_string())
 }
 
@@ -213,7 +290,7 @@ fn cert_missing() -> AppError {
 }
 
 /// Background problems are logged at most every ten minutes.
-fn warn_rarely(what: &str) {
+pub(crate) fn warn_rarely(what: &str) {
   let now = now_ms();
   let last = LAST_WARN_MS.load(Ordering::Relaxed);
   if now - last >= 600_000 {
@@ -222,15 +299,15 @@ fn warn_rarely(what: &str) {
   }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
   chrono::Utc::now().timestamp_millis()
 }
 
-fn parse_uuid(raw: &str, msg: &str) -> Result<Uuid, AppError> {
+pub(crate) fn parse_uuid(raw: &str, msg: &str) -> Result<Uuid, AppError> {
   Uuid::parse_str(raw.trim()).map_err(|_| bad(msg))
 }
 
-fn body_json(body: &[u8]) -> Result<Value, AppError> {
+pub(crate) fn body_json(body: &[u8]) -> Result<Value, AppError> {
   if body.iter().all(|b| b.is_ascii_whitespace()) {
     return Ok(json!({}));
   }
@@ -240,18 +317,18 @@ fn body_json(body: &[u8]) -> Result<Value, AppError> {
   }
 }
 
-fn txt<'a>(v: &'a Value, key: &str) -> &'a str {
+pub(crate) fn txt<'a>(v: &'a Value, key: &str) -> &'a str {
   v.get(key).and_then(|x| x.as_str()).unwrap_or("")
 }
 
-fn list<'a>(v: &'a Value, key: &str) -> &'a [Value] {
+pub(crate) fn list<'a>(v: &'a Value, key: &str) -> &'a [Value] {
   match v.get(key).and_then(|x| x.as_array()) {
     Some(a) => a.as_slice(),
     None => &[],
   }
 }
 
-fn flag(v: &Value, key: &str, default: bool) -> bool {
+pub(crate) fn flag(v: &Value, key: &str, default: bool) -> bool {
   v.get(key).and_then(|x| x.as_bool()).unwrap_or(default)
 }
 
@@ -265,11 +342,11 @@ fn num(v: &Value, key: &str, default: i64) -> i64 {
   }
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
   s.chars().take(max).collect()
 }
 
-fn guest_role() -> i32 {
+pub(crate) fn guest_role() -> i32 {
   AFRole::Guest.into()
 }
 
@@ -281,7 +358,7 @@ fn uid_of(v: Option<&Value>) -> Option<i64> {
   }
 }
 
-fn finished(status: &str) -> bool {
+pub(crate) fn finished(status: &str) -> bool {
   status == "completed" || status == "passed"
 }
 
@@ -307,7 +384,7 @@ fn kind_of(q: &Value) -> &'static str {
 
 /// Serialises writes to assignments / groups of one workspace (requests and
 /// the background re-sync), for the rest of the transaction.
-async fn lock_ws(conn: &mut PgConnection, ws: Uuid) -> Result<(), AppError> {
+pub(crate) async fn lock_ws(conn: &mut PgConnection, ws: Uuid) -> Result<(), AppError> {
   sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
     .bind(WS_LOCK_CLASS)
     .bind(ws.to_string())
@@ -322,24 +399,29 @@ fn course_path(course: Uuid) -> String {
 
 /// Chat messages get a full link (Messages turns plain https links into
 /// links); without a public address the path still tells people where to go.
-fn course_link(course: Uuid) -> String {
+pub(crate) fn course_link(course: Uuid) -> String {
+  web_link(&course_path(course))
+}
+
+/// P3 paths: the same for any page of the app ("/app/learning").
+pub(crate) fn web_link(path: &str) -> String {
   let base = std::env::var("APPFLOWY_WEB_URL").unwrap_or_default();
   let base = base.trim().trim_end_matches('/');
   if base.starts_with("https://") || base.starts_with("http://") {
-    format!("{}{}", base, course_path(course))
+    format!("{}{}", base, path)
   } else {
-    course_path(course)
+    path.to_string()
   }
 }
 
 /// Day number (days since 1970-01-01) of a moment in a time zone given in
 /// minutes east of UTC.
-fn local_day(ms: i64, tz: i32) -> i64 {
+pub(crate) fn local_day(ms: i64, tz: i32) -> i64 {
   (ms + i64::from(tz) * 60_000).div_euclid(DAY_MS)
 }
 
 /// UTC ms of local midnight that starts day `day`.
-fn day_start(day: i64, tz: i32) -> i64 {
+pub(crate) fn day_start(day: i64, tz: i32) -> i64 {
   day * DAY_MS - i64::from(tz) * 60_000
 }
 
@@ -358,7 +440,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 /// "Fri 30 Oct".
-fn day_label(day: i64) -> String {
+pub(crate) fn day_label(day: i64) -> String {
   let weekday = usize::try_from((day + 4).rem_euclid(7))
     .ok()
     .and_then(|i| WEEKDAYS.get(i).copied())
@@ -376,13 +458,13 @@ fn day_label(day: i64) -> String {
 // ---------------------------------------------------------------------------
 
 /// Phase 1 checks (signed-in, non-guest member, tables ready) plus our tables.
-async fn ctx(state: &AppState, user: &UserUuid, ws: &str) -> Result<Ctx, AppError> {
+pub(crate) async fn ctx(state: &AppState, user: &UserUuid, ws: &str) -> Result<Ctx, AppError> {
   let c = carehub_learning::ctx(state, user, ws).await?;
   ready(&state.pg_pool).await?;
   Ok(c)
 }
 
-fn need_assign(c: &Ctx) -> Result<(), AppError> {
+pub(crate) fn need_assign(c: &Ctx) -> Result<(), AppError> {
   if c.has("learning_assign") {
     Ok(())
   } else {
@@ -390,7 +472,7 @@ fn need_assign(c: &Ctx) -> Result<(), AppError> {
   }
 }
 
-fn need_read(c: &Ctx) -> Result<(), AppError> {
+pub(crate) fn need_read(c: &Ctx) -> Result<(), AppError> {
   if c.has("learning_assign") || c.has("learning_build") || c.has("learning_analytics") {
     Ok(())
   } else {
@@ -410,32 +492,32 @@ fn need_reports(c: &Ctx) -> Result<(), AppError> {
 // Members, roles, groups, courses, assignments
 // ---------------------------------------------------------------------------
 
-struct Person {
+pub(crate) struct Person {
   uid: i64,
-  name: String,
-  email: String,
+  pub(crate) name: String,
+  pub(crate) email: String,
   role_id: String,
   role_name: String,
 }
 
 /// Current non-guest members with their Care Hub role, plus the role list.
-struct People {
+pub(crate) struct People {
   list: Vec<Person>,
   index: HashMap<i64, usize>,
   roles: Vec<Value>,
 }
 
 impl People {
-  fn has(&self, uid: i64) -> bool {
+  pub(crate) fn has(&self, uid: i64) -> bool {
     self.index.contains_key(&uid)
   }
 
-  fn get(&self, uid: i64) -> Option<&Person> {
+  pub(crate) fn get(&self, uid: i64) -> Option<&Person> {
     self.index.get(&uid).and_then(|i| self.list.get(*i))
   }
 }
 
-async fn people_of(pool: &PgPool, ws: Uuid) -> Result<People, AppError> {
+pub(crate) async fn people_of(pool: &PgPool, ws: Uuid) -> Result<People, AppError> {
   carehub_extras::ensure_tables(pool).await?;
   let rows: Vec<(i64, String, String, i32)> = sqlx::query_as(
     "SELECT m.uid, COALESCE(NULLIF(u.name, ''), split_part(COALESCE(u.email, ''), '@', 1), ''), \
@@ -470,7 +552,7 @@ async fn people_of(pool: &PgPool, ws: Uuid) -> Result<People, AppError> {
   Ok(People { list, index, roles })
 }
 
-struct Group {
+pub(crate) struct Group {
   id: Uuid,
   name: String,
   description: String,
@@ -478,7 +560,7 @@ struct Group {
   members: Vec<i64>,
 }
 
-async fn groups_of(conn: &mut PgConnection, ws: Uuid) -> Result<Vec<Group>, AppError> {
+pub(crate) async fn groups_of(conn: &mut PgConnection, ws: Uuid) -> Result<Vec<Group>, AppError> {
   let rows: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
     "SELECT id, name, description, updated_ms FROM carehub_learning_group \
      WHERE workspace_id = $1 ORDER BY LOWER(name), id",
@@ -512,9 +594,9 @@ async fn groups_of(conn: &mut PgConnection, ws: Uuid) -> Result<Vec<Group>, AppE
   )
 }
 
-struct Course {
-  title: String,
-  status: String,
+pub(crate) struct Course {
+  pub(crate) title: String,
+  pub(crate) status: String,
   version: i32,
   catalog: bool,
 }
@@ -574,7 +656,10 @@ async fn titles_of(pool: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, String>,
   Ok(rows.into_iter().collect())
 }
 
-async fn names_of(pool: &PgPool, uids: Vec<i64>) -> Result<HashMap<i64, String>, AppError> {
+pub(crate) async fn names_of(
+  pool: &PgPool,
+  uids: Vec<i64>,
+) -> Result<HashMap<i64, String>, AppError> {
   if uids.is_empty() {
     return Ok(HashMap::new());
   }
@@ -588,19 +673,61 @@ async fn names_of(pool: &PgPool, uids: Vec<i64>) -> Result<HashMap<i64, String>,
   Ok(rows.into_iter().collect())
 }
 
-struct Asg {
-  id: Uuid,
-  course: Uuid,
-  kind: String,
-  target: String,
+pub(crate) struct Asg {
+  pub(crate) id: Uuid,
+  pub(crate) course: Uuid,
+  pub(crate) kind: String,
+  pub(crate) target: String,
+  pub(crate) due_ms: Option<i64>,
+  pub(crate) tz: i32,
+  pub(crate) required: bool,
+  pub(crate) note: String,
+  pub(crate) calendar: bool,
+  pub(crate) created_by: i64,
+  pub(crate) created_ms: i64,
+  pub(crate) updated_ms: i64,
+  /// P1 due_days: due N days after each person is added (or N was set).
+  pub(crate) due_days: Option<i32>,
+  days_from_ms: i64,
+  /// P3 paths: the path this assignment belongs to (None = direct).
+  pub(crate) path: Option<Uuid>,
+}
+
+impl Asg {
+  /// P1 due_days: one person's due on this assignment.
+  pub(crate) fn due_for(&self, assigned_ms: i64, renew_due_ms: Option<i64>) -> Option<i64> {
+    seat_due(
+      self.due_ms,
+      self.due_days,
+      self.days_from_ms,
+      self.tz,
+      assigned_ms,
+      renew_due_ms,
+    )
+  }
+}
+
+/// P1 due_days / P2 recert: one person's due on one assignment (ROW_DUE in
+/// SQL): a renewal due, else 23:59:59.999 local on the day N days after they
+/// were added (or after N was set), else the assignment's date.
+pub(crate) fn seat_due(
   due_ms: Option<i64>,
+  due_days: Option<i32>,
+  days_from_ms: i64,
   tz: i32,
-  required: bool,
-  note: String,
-  calendar: bool,
-  created_by: i64,
-  created_ms: i64,
-  updated_ms: i64,
+  assigned_ms: i64,
+  renew_due_ms: Option<i64>,
+) -> Option<i64> {
+  if renew_due_ms.is_some() {
+    return renew_due_ms;
+  }
+  match due_days {
+    Some(n) => {
+      let day = local_day(assigned_ms.max(days_from_ms), tz) + i64::from(n);
+      Some(day_start(day + 1, tz) - 1)
+    },
+    None => due_ms,
+  }
 }
 
 type AsgRow = (
@@ -616,12 +743,15 @@ type AsgRow = (
   i64,
   i64,
   i64,
+  Option<i32>,
+  i64,
+  Option<Uuid>,
 );
 
 async fn assignments_of(pool: &PgPool, ws: Uuid, only: Option<Uuid>) -> Result<Vec<Asg>, AppError> {
   let rows: Vec<AsgRow> = sqlx::query_as(
     "SELECT id, course_id, target_kind, target_id, due_ms, tz_minutes, required, note, calendar, \
-       created_by, created_ms, updated_ms \
+       created_by, created_ms, updated_ms, due_days, days_from_ms, path_id \
      FROM carehub_learning_assignment \
      WHERE workspace_id = $1 AND ($2::UUID IS NULL OR course_id = $2)",
   )
@@ -645,6 +775,9 @@ async fn assignments_of(pool: &PgPool, ws: Uuid, only: Option<Uuid>) -> Result<V
         created_by: r.9,
         created_ms: r.10,
         updated_ms: r.11,
+        due_days: r.12,
+        days_from_ms: r.13,
+        path: r.14,
       })
       .collect(),
   )
@@ -658,6 +791,11 @@ struct Eff {
   assigned_ms: i64,
   note: String,
   note_ms: i64,
+  /// P2 recert: they're taking it again because their finish ran out.
+  renewal: bool,
+  /// P3 paths: the paths that assign it to them; direct = also assigned outside a path.
+  paths: Vec<Uuid>,
+  direct: bool,
 }
 
 impl Eff {
@@ -668,7 +806,23 @@ impl Eff {
       assigned_ms: i64::MAX,
       note: String::new(),
       note_ms: i64::MIN,
+      renewal: false,
+      paths: Vec::new(),
+      direct: false,
     }
+  }
+
+  /// P2 recert / P3 paths: where one of their rows comes from.
+  fn mark(&mut self, path: Option<Uuid>, renewal: bool) {
+    match path {
+      Some(p) => {
+        if !self.paths.contains(&p) {
+          self.paths.push(p);
+        }
+      },
+      None => self.direct = true,
+    }
+    self.renewal = self.renewal || renewal;
   }
 
   fn add(&mut self, due_ms: Option<i64>, required: bool, note: &str, updated_ms: i64, assigned_ms: i64) {
@@ -694,6 +848,10 @@ impl Eff {
       "overdue": self.overdue(status, now),
       "assigned_ms": self.assigned_ms,
       "note": self.note,
+      // P2 recert / P3 paths
+      "renewal": self.renewal,
+      "paths": self.paths.iter().map(|p| p.to_string()).collect::<Vec<String>>(),
+      "direct": self.direct,
     })
   }
 }
@@ -733,31 +891,38 @@ fn with_counts(mut v: Value, t: &Tally, total_key: &str) -> Value {
   v
 }
 
-struct Enr {
-  status: String,
-  percent: i32,
+pub(crate) struct Enr {
+  pub(crate) status: String,
+  pub(crate) percent: i32,
   completed_ms: Option<i64>,
 }
 
 /// Everything the assignment lists and reports need, loaded once per request.
 /// Only current non-guest members are counted.
-struct Board {
-  now: i64,
-  people: People,
-  courses: BTreeMap<Uuid, Course>,
-  asgs: Vec<Asg>,
-  rows: HashMap<Uuid, Vec<i64>>,
+pub(crate) struct Board {
+  pub(crate) now: i64,
+  pub(crate) people: People,
+  pub(crate) courses: BTreeMap<Uuid, Course>,
+  pub(crate) asgs: Vec<Asg>,
+  pub(crate) rows: HashMap<Uuid, Vec<i64>>,
+  /// P1 due_days: (assignment, uid) → (assigned_ms, their due on it).
+  pub(crate) seats: HashMap<(Uuid, i64), (i64, Option<i64>)>,
   eff: HashMap<(Uuid, i64), Eff>,
-  enr: HashMap<(Uuid, i64), Enr>,
+  pub(crate) enr: HashMap<(Uuid, i64), Enr>,
+  /// P2 recert: renewal months per course.
+  recert: HashMap<Uuid, i64>,
+  /// P3 paths: titles of the workspace's paths.
+  path_titles: HashMap<Uuid, String>,
 }
 
 impl Board {
-  async fn load(pool: &PgPool, ws: Uuid, only: Option<Uuid>) -> Result<Board, AppError> {
+  pub(crate) async fn load(pool: &PgPool, ws: Uuid, only: Option<Uuid>) -> Result<Board, AppError> {
     let people = people_of(pool, ws).await?;
     let courses = courses_of(pool, ws, only).await?;
     let asgs = assignments_of(pool, ws, only).await?;
-    let raw: Vec<(Uuid, i64, i64)> = sqlx::query_as(
-      "SELECT s.assignment_id, s.uid, s.assigned_ms FROM carehub_learning_assignee s \
+    let raw: Vec<(Uuid, i64, i64, Option<i64>)> = sqlx::query_as(
+      "SELECT s.assignment_id, s.uid, s.assigned_ms, s.renew_due_ms \
+       FROM carehub_learning_assignee s \
        JOIN carehub_learning_assignment a ON a.id = s.assignment_id \
        WHERE a.workspace_id = $1 AND ($2::UUID IS NULL OR a.course_id = $2)",
     )
@@ -776,8 +941,9 @@ impl Board {
     .await?;
     let by_id: HashMap<Uuid, usize> = asgs.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
     let mut rows: HashMap<Uuid, Vec<i64>> = HashMap::new();
+    let mut seats: HashMap<(Uuid, i64), (i64, Option<i64>)> = HashMap::new();
     let mut eff: HashMap<(Uuid, i64), Eff> = HashMap::new();
-    for (asg_id, uid, assigned_ms) in raw {
+    for (asg_id, uid, assigned_ms, renew_due_ms) in raw {
       if !people.has(uid) {
         continue;
       }
@@ -786,11 +952,23 @@ impl Board {
         None => continue,
       };
       rows.entry(asg_id).or_default().push(uid);
-      eff
-        .entry((a.course, uid))
-        .or_insert_with(Eff::new)
-        .add(a.due_ms, a.required, &a.note, a.updated_ms, assigned_ms);
+      // P1 due_days / P2 recert: each person's own due on this assignment.
+      let due = a.due_for(assigned_ms, renew_due_ms);
+      seats.insert((asg_id, uid), (assigned_ms, due));
+      let e = eff.entry((a.course, uid)).or_insert_with(Eff::new);
+      e.add(due, a.required, &a.note, a.updated_ms, assigned_ms);
+      e.mark(a.path, renew_due_ms.is_some());
     }
+    // P2 recert: renewal months of these courses (cached per version).
+    let live: Vec<(Uuid, i32)> = courses.iter().map(|(id, c)| (*id, c.version)).collect();
+    let recert = recert_for(pool, &live).await?;
+    // P3 paths: names for path rows.
+    let titles: Vec<(Uuid, String)> =
+      sqlx::query_as("SELECT id, title FROM carehub_learning_path WHERE workspace_id = $1")
+        .bind(ws)
+        .fetch_all(pool)
+        .await?;
+    let path_titles: HashMap<Uuid, String> = titles.into_iter().collect();
     let enr = enr_rows
       .into_iter()
       .map(|(course, uid, status, percent, completed_ms)| {
@@ -810,8 +988,11 @@ impl Board {
       courses,
       asgs,
       rows,
+      seats,
       eff,
       enr,
+      recert,
+      path_titles,
     })
   }
 
@@ -823,7 +1004,7 @@ impl Board {
     self.eff.get(&(course, uid)).and_then(|e| e.due_ms)
   }
 
-  fn target_name(&self, a: &Asg, groups: &[Group]) -> String {
+  pub(crate) fn target_name(&self, a: &Asg, groups: &[Group]) -> String {
     match a.kind.as_str() {
       "person" => a
         .target
@@ -862,6 +1043,7 @@ impl Board {
       "course_title": title,
       "target": { "kind": a.kind, "id": a.target, "name": self.target_name(a, groups) },
       "due_ms": a.due_ms,
+      "due_days": a.due_days,
       "tz_minutes": a.tz,
       "required": a.required,
       "note": a.note,
@@ -869,6 +1051,9 @@ impl Board {
       "created_ms": a.created_ms,
       "created_by_name": names.get(&a.created_by).cloned().unwrap_or_default(),
       "updated_ms": a.updated_ms,
+      // P3 paths
+      "path_id": a.path.map(|p| p.to_string()),
+      "path_title": a.path.and_then(|p| self.path_titles.get(&p).cloned()),
     });
     with_counts(v, &t, "people")
   }
@@ -884,6 +1069,11 @@ impl Board {
         let e = self.enr.get(&(a.course, *uid));
         let eff = self.eff.get(&(a.course, *uid));
         let status = e.map(|x| x.status.as_str());
+        // P2 recert: when a finish runs out.
+        let expires = e
+          .filter(|x| finished(&x.status))
+          .and_then(|x| x.completed_ms)
+          .and_then(|t| self.recert.get(&a.course).map(|n| add_months(t, *n)));
         out.push((
           p.name.to_lowercase(),
           json!({
@@ -896,6 +1086,8 @@ impl Board {
             "overdue": eff.map(|x| x.overdue(status, self.now)).unwrap_or(false),
             "assigned_ms": eff.map(|x| x.assigned_ms).unwrap_or(0),
             "completed_ms": e.and_then(|x| x.completed_ms),
+            "expires_ms": expires,
+            "expired": expires.map(|t| t <= self.now).unwrap_or(false),
           }),
         ));
       }
@@ -918,7 +1110,7 @@ impl Board {
 }
 
 /// Who a target covers right now (current non-guest members only).
-fn want_for(kind: &str, id: &str, people: &People, groups: &[Group]) -> Vec<i64> {
+pub(crate) fn want_for(kind: &str, id: &str, people: &People, groups: &[Group]) -> Vec<i64> {
   match kind {
     "person" => id
       .parse::<i64>()
@@ -944,7 +1136,7 @@ fn want_for(kind: &str, id: &str, people: &People, groups: &[Group]) -> Vec<i64>
 /// Makes the assignee rows of one assignment match `want`: adds missing people
 /// and removes people no longer covered unless they finished (progress is never
 /// touched).
-async fn sync_assignment(
+pub(crate) async fn sync_assignment(
   conn: &mut PgConnection,
   asg: Uuid,
   course: Uuid,
@@ -981,11 +1173,12 @@ async fn sync_assignment(
   Ok(())
 }
 
-/// A new due date: due / overdue reminders start again from scratch.
+/// A new due date: due / overdue reminders start again from scratch (P2
+/// recert: not for people on a renewal due, which a date change doesn't move).
 async fn rearm(conn: &mut PgConnection, asg: Uuid) -> Result<(), AppError> {
   sqlx::query(
     "UPDATE carehub_learning_assignee SET sent_due_ms = 0, sent_overdue_ms = 0 \
-     WHERE assignment_id = $1",
+     WHERE assignment_id = $1 AND renew_due_ms IS NULL",
   )
   .bind(asg)
   .execute(&mut *conn)
@@ -995,7 +1188,7 @@ async fn rearm(conn: &mut PgConnection, asg: Uuid) -> Result<(), AppError> {
 
 /// After a change commits: reminders and calendar entries for those courses,
 /// in the background so the request returns straight away.
-fn after_change(pool: &PgPool, mut courses: Vec<Uuid>) {
+pub(crate) fn after_change(pool: &PgPool, mut courses: Vec<Uuid>) {
   courses.sort();
   courses.dedup();
   if courses.is_empty() {
@@ -1003,11 +1196,19 @@ fn after_change(pool: &PgPool, mut courses: Vec<Uuid>) {
   }
   let pool = pool.clone();
   tokio::spawn(async move {
+    // P2 recert: people just assigned whose finish ran out start again now.
+    if let Err(err) = renewals(&pool, Some(courses.as_slice())).await {
+      warn_rarely(&format!("renewals: {}", err));
+    }
     if let Err(err) = deliver(&pool, Some(courses.clone())).await {
       warn_rarely(&format!("reminders: {}", err));
     }
     if let Err(err) = sync_calendar(&pool, Some(courses)).await {
       warn_rarely(&format!("calendar entries: {}", err));
+    }
+    // P3 paths: path messages, reminders and calendar entries.
+    if let Err(err) = carehub_learning_paths::tick_paths(&pool).await {
+      warn_rarely(&format!("learning paths: {}", err));
     }
   });
 }
@@ -1058,7 +1259,7 @@ async fn groups(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, Ap
   let mut conn = pool.acquire().await?;
   let groups = groups_of(&mut conn, c.ws).await?;
   let used: Vec<(String, i64)> = sqlx::query_as(
-    "SELECT a.target_id, COUNT(*)::BIGINT FROM carehub_learning_assignment a \
+    "SELECT a.target_id, COUNT(DISTINCT a.course_id)::BIGINT FROM carehub_learning_assignment a \
      JOIN carehub_course c ON c.id = a.course_id \
      WHERE a.workspace_id = $1 AND a.target_kind = 'group' AND c.status = 'published' \
      GROUP BY a.target_id",
@@ -1359,6 +1560,27 @@ fn parse_due(v: Option<&Value>) -> Result<Option<i64>, AppError> {
   }
 }
 
+/// P1 due_days: None / null = no days; else a whole number 1-365.
+fn parse_days(v: Option<&Value>) -> Result<Option<i32>, AppError> {
+  match v {
+    None | Some(Value::Null) => Ok(None),
+    Some(x) => {
+      let n = x
+        .as_i64()
+        .or_else(|| {
+          x.as_f64()
+            .filter(|f| f.is_finite() && f.fract().abs() < 1e-9 && f.abs() < 1e9)
+            .map(|f| f as i64)
+        })
+        .ok_or_else(|| bad(DAYS_MSG))?;
+      if !(1..=MAX_DUE_DAYS).contains(&n) {
+        return Err(bad(DAYS_MSG));
+      }
+      i32::try_from(n).map(Some).map_err(|_| bad(DAYS_MSG))
+    },
+  }
+}
+
 /// None = leave as it is; Some("") clears.
 fn parse_note(v: &Value) -> Result<Option<String>, AppError> {
   match v.get("note") {
@@ -1418,6 +1640,181 @@ fn normalise_target(
   }
 }
 
+/// P1 due_days / P3 paths: the settings of POST /assignments and POST
+/// /paths/{id}/assign.
+pub(crate) struct Plan {
+  pub(crate) due_ms: Option<i64>,
+  pub(crate) due_days: Option<i32>,
+  pub(crate) tz: i32,
+  pub(crate) required: bool,
+  pub(crate) note: String,
+  pub(crate) calendar: bool,
+  pub(crate) notify: bool,
+}
+
+/// Checks in the order POST /assignments always used (targets, then dates).
+pub(crate) fn plan_of(v: &Value, now: i64) -> Result<Plan, AppError> {
+  let raw = list(v, "targets");
+  if raw.is_empty() {
+    return Err(bad(NO_TARGETS_MSG));
+  }
+  if raw.len() > MAX_TARGETS {
+    return Err(bad(TOO_MANY_TARGETS_MSG));
+  }
+  let due_ms = parse_due(v.get("due_ms"))?;
+  // P1 due_days
+  let due_days = parse_days(v.get("due_days"))?;
+  if due_ms.is_some() && due_days.is_some() {
+    return Err(bad(BOTH_DUE_MSG));
+  }
+  if due_ms.map(|d| d <= now).unwrap_or(false) {
+    return Err(bad(PAST_DUE_MSG));
+  }
+  Ok(Plan {
+    due_ms,
+    due_days,
+    tz: parse_tz(v).unwrap_or(0),
+    required: flag(v, "required", false),
+    note: parse_note(v)?.unwrap_or_default(),
+    calendar: flag(v, "calendar", true),
+    notify: flag(v, "notify", true),
+  })
+}
+
+pub(crate) type Picked = Vec<(String, String, Vec<i64>)>;
+
+/// The request's targets in stored form with who they cover now (unknown ones
+/// dropped, repeats once).
+pub(crate) fn pick_targets(
+  v: &Value,
+  people: &People,
+  groups: &[Group],
+) -> Result<Picked, AppError> {
+  let mut seen: HashSet<(String, String)> = HashSet::new();
+  let mut targets: Picked = Vec::new();
+  for t in list(v, "targets") {
+    let id = match t.get("id") {
+      Some(Value::String(s)) => s.trim().to_string(),
+      Some(Value::Number(n)) => n.to_string(),
+      _ => String::new(),
+    };
+    let (kind, id) = match normalise_target(txt(t, "kind").trim(), &id, people, groups) {
+      Some(x) => x,
+      None => continue,
+    };
+    if !seen.insert((kind.clone(), id.clone())) {
+      continue;
+    }
+    let want = want_for(&kind, &id, people, groups);
+    targets.push((kind, id, want));
+  }
+  if targets.is_empty() {
+    return Err(bad(UNKNOWN_TARGETS_MSG));
+  }
+  Ok(targets)
+}
+
+/// P1 due_days / P3 paths: creates or updates the assignment of one course to
+/// one target, the direct one (path None: path_id IS NULL) or a path's.
+/// Returns (id, newly created). A new due date or number of days re-arms
+/// reminders; switching to days or a new N counts from now for people on it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn put_assignment(
+  conn: &mut PgConnection,
+  ws: Uuid,
+  course: Uuid,
+  path: Option<Uuid>,
+  kind: &str,
+  target: &str,
+  plan: &Plan,
+  by: i64,
+  now: i64,
+) -> Result<(Uuid, bool), AppError> {
+  let existing: Option<(Uuid, Option<i64>, Option<i32>, i64)> = sqlx::query_as(
+    "SELECT id, due_ms, due_days, days_from_ms FROM carehub_learning_assignment \
+     WHERE course_id = $1 AND target_kind = $2 AND target_id = $3 \
+       AND path_id IS NOT DISTINCT FROM $4 FOR UPDATE",
+  )
+  .bind(course)
+  .bind(kind)
+  .bind(target)
+  .bind(path)
+  .fetch_optional(&mut *conn)
+  .await?;
+  match existing {
+    Some((asg, old_due, old_days, old_from)) => {
+      let days_from = if plan.due_days.is_some() && plan.due_days != old_days {
+        now
+      } else {
+        old_from
+      };
+      sqlx::query(
+        "UPDATE carehub_learning_assignment SET due_ms = $2, tz_minutes = $3, required = $4, \
+           note = $5, calendar = $6, notify = $7, updated_ms = $8, due_days = $9, \
+           days_from_ms = $10 WHERE id = $1",
+      )
+      .bind(asg)
+      .bind(plan.due_ms)
+      .bind(plan.tz)
+      .bind(plan.required)
+      .bind(&plan.note)
+      .bind(plan.calendar)
+      .bind(plan.notify)
+      .bind(now)
+      .bind(plan.due_days)
+      .bind(days_from)
+      .execute(&mut *conn)
+      .await?;
+      if old_due != plan.due_ms || old_days != plan.due_days {
+        rearm(conn, asg).await?;
+      }
+      Ok((asg, false))
+    },
+    None => {
+      let asg = Uuid::new_v4();
+      sqlx::query(
+        "INSERT INTO carehub_learning_assignment (id, workspace_id, course_id, target_kind, \
+           target_id, due_ms, tz_minutes, required, note, calendar, notify, created_by, \
+           created_ms, updated_ms, due_days, path_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14, $15)",
+      )
+      .bind(asg)
+      .bind(ws)
+      .bind(course)
+      .bind(kind)
+      .bind(target)
+      .bind(plan.due_ms)
+      .bind(plan.tz)
+      .bind(plan.required)
+      .bind(&plan.note)
+      .bind(plan.calendar)
+      .bind(plan.notify)
+      .bind(by)
+      .bind(now)
+      .bind(plan.due_days)
+      .bind(path)
+      .execute(&mut *conn)
+      .await?;
+      Ok((asg, true))
+    },
+  }
+}
+
+/// P3 paths: PUT / DELETE on a path's assignment are refused.
+async fn path_row(conn: &mut PgConnection, path: Uuid) -> AppError {
+  let title: Option<String> =
+    sqlx::query_scalar("SELECT title FROM carehub_learning_path WHERE id = $1")
+      .bind(path)
+      .fetch_optional(&mut *conn)
+      .await
+      .ok()
+      .flatten();
+  bad(&format!(
+    "This course is assigned through the learning path “{}”. Change it on the Paths tab.",
+    title.unwrap_or_else(|| "Untitled path".to_string())
+  ))
+}
+
 /// POST /assignments
 async fn create_assignments(
   state: &AppState,
@@ -1444,111 +1841,26 @@ async fn create_assignments(
   if status != "published" || published.is_none() {
     return Err(bad(NOT_PUBLISHED_MSG));
   }
-  let raw = list(&v, "targets");
-  if raw.is_empty() {
-    return Err(bad(NO_TARGETS_MSG));
-  }
-  if raw.len() > MAX_TARGETS {
-    return Err(bad(TOO_MANY_TARGETS_MSG));
-  }
   let now = now_ms();
-  let due = parse_due(v.get("due_ms"))?;
-  if due.map(|d| d <= now).unwrap_or(false) {
-    return Err(bad(PAST_DUE_MSG));
-  }
-  let tz = parse_tz(&v).unwrap_or(0);
-  let required = flag(&v, "required", false);
-  let note = parse_note(&v)?.unwrap_or_default();
-  let calendar = flag(&v, "calendar", true);
-  let notify = flag(&v, "notify", true);
+  let plan = plan_of(&v, now)?;
   let people = people_of(pool, c.ws).await?;
   let mut tx = pool.begin().await?;
   lock_ws(&mut tx, c.ws).await?;
   let groups = groups_of(&mut tx, c.ws).await?;
-  let mut seen: HashSet<(String, String)> = HashSet::new();
-  let mut targets: Vec<(String, String, Vec<i64>)> = Vec::new();
-  for t in raw {
-    let id = match t.get("id") {
-      Some(Value::String(s)) => s.trim().to_string(),
-      Some(Value::Number(n)) => n.to_string(),
-      _ => String::new(),
-    };
-    let (kind, id) = match normalise_target(txt(t, "kind").trim(), &id, &people, &groups) {
-      Some(x) => x,
-      None => continue,
-    };
-    if !seen.insert((kind.clone(), id.clone())) {
-      continue;
-    }
-    let want = want_for(&kind, &id, &people, &groups);
-    targets.push((kind, id, want));
-  }
-  if targets.is_empty() {
-    return Err(bad(UNKNOWN_TARGETS_MSG));
-  }
+  let targets = pick_targets(&v, &people, &groups)?;
   let mut created: i64 = 0;
   let mut updated: i64 = 0;
   let mut covered: HashSet<i64> = HashSet::new();
   for (kind, id, want) in &targets {
-    let existing: Option<(Uuid, Option<i64>)> = sqlx::query_as(
-      "SELECT id, due_ms FROM carehub_learning_assignment \
-       WHERE course_id = $1 AND target_kind = $2 AND target_id = $3 FOR UPDATE",
-    )
-    .bind(course)
-    .bind(kind)
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let asg = match existing {
-      Some((asg, old_due)) => {
-        sqlx::query(
-          "UPDATE carehub_learning_assignment SET due_ms = $2, tz_minutes = $3, required = $4, \
-             note = $5, calendar = $6, notify = $7, updated_ms = $8 WHERE id = $1",
-        )
-        .bind(asg)
-        .bind(due)
-        .bind(tz)
-        .bind(required)
-        .bind(&note)
-        .bind(calendar)
-        .bind(notify)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        if old_due != due {
-          rearm(&mut tx, asg).await?;
-        }
-        updated += 1;
-        asg
-      },
-      None => {
-        let asg = Uuid::new_v4();
-        sqlx::query(
-          "INSERT INTO carehub_learning_assignment (id, workspace_id, course_id, target_kind, \
-             target_id, due_ms, tz_minutes, required, note, calendar, notify, created_by, \
-             created_ms, updated_ms) \
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)",
-        )
-        .bind(asg)
-        .bind(c.ws)
-        .bind(course)
-        .bind(kind)
-        .bind(id)
-        .bind(due)
-        .bind(tz)
-        .bind(required)
-        .bind(&note)
-        .bind(calendar)
-        .bind(notify)
-        .bind(c.uid())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        created += 1;
-        asg
-      },
-    };
-    sync_assignment(&mut tx, asg, course, c.ws, notify, want, now).await?;
+    // P3 paths: only the direct assignment (path_id IS NULL) is edited here.
+    let (asg, fresh) =
+      put_assignment(&mut tx, c.ws, course, None, kind, id, &plan, c.uid(), now).await?;
+    if fresh {
+      created += 1;
+    } else {
+      updated += 1;
+    }
+    sync_assignment(&mut tx, asg, course, c.ws, plan.notify, want, now).await?;
     covered.extend(want.iter().copied());
   }
   tx.commit().await?;
@@ -1660,23 +1972,41 @@ async fn update_assignment(
   let now = now_ms();
   let mut tx = pool.begin().await?;
   lock_ws(&mut tx, c.ws).await?;
-  let row: Option<(Uuid, Option<i64>, i32, bool, String, bool)> = sqlx::query_as(
-    "SELECT course_id, due_ms, tz_minutes, required, note, calendar \
-     FROM carehub_learning_assignment WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
-  )
-  .bind(asg)
-  .bind(c.ws)
-  .fetch_optional(&mut *tx)
-  .await?;
-  let (course, old_due, old_tz, old_required, old_note, old_calendar) =
+  #[allow(clippy::type_complexity)]
+  let row: Option<(Uuid, Option<i64>, i32, bool, String, bool, Option<i32>, i64, Option<Uuid>)> =
+    sqlx::query_as(
+      "SELECT course_id, due_ms, tz_minutes, required, note, calendar, due_days, days_from_ms, \
+         path_id FROM carehub_learning_assignment WHERE id = $1 AND workspace_id = $2 FOR UPDATE",
+    )
+    .bind(asg)
+    .bind(c.ws)
+    .fetch_optional(&mut *tx)
+    .await?;
+  let (course, old_due, old_tz, old_required, old_note, old_calendar, old_days, old_from, path) =
     row.ok_or_else(assignment_missing)?;
-  let due = match v.get("due_ms") {
-    Some(raw) => parse_due(Some(raw))?,
-    None => old_due,
+  // P3 paths: a path's assignment is changed on the Paths tab.
+  if let Some(p) = path {
+    return Err(path_row(&mut tx, p).await);
+  }
+  // P1 due_days: due_ms / due_days are replaced as a pair (a missing one = none).
+  let (due, days) = if v.get("due_ms").is_some() || v.get("due_days").is_some() {
+    let due = parse_due(v.get("due_ms"))?;
+    let days = parse_days(v.get("due_days"))?;
+    if due.is_some() && days.is_some() {
+      return Err(bad(BOTH_DUE_MSG));
+    }
+    (due, days)
+  } else {
+    (old_due, old_days)
   };
   if due != old_due && due.map(|d| d <= now).unwrap_or(false) {
     return Err(bad(PAST_DUE_MSG));
   }
+  let days_from = if days.is_some() && days != old_days {
+    now
+  } else {
+    old_from
+  };
   let tz = parse_tz(&v).unwrap_or(old_tz);
   let required = v
     .get("required")
@@ -1689,7 +2019,7 @@ async fn update_assignment(
     .unwrap_or(old_calendar);
   sqlx::query(
     "UPDATE carehub_learning_assignment SET due_ms = $2, tz_minutes = $3, required = $4, \
-       note = $5, calendar = $6, updated_ms = $7 WHERE id = $1",
+       note = $5, calendar = $6, updated_ms = $7, due_days = $8, days_from_ms = $9 WHERE id = $1",
   )
   .bind(asg)
   .bind(due)
@@ -1698,9 +2028,11 @@ async fn update_assignment(
   .bind(note)
   .bind(calendar)
   .bind(now)
+  .bind(days)
+  .bind(days_from)
   .execute(&mut *tx)
   .await?;
-  if due != old_due {
+  if due != old_due || days != old_days {
     rearm(&mut tx, asg).await?;
   }
   tx.commit().await?;
@@ -1721,6 +2053,18 @@ async fn delete_assignment(
   let pool = &state.pg_pool;
   let mut tx = pool.begin().await?;
   lock_ws(&mut tx, c.ws).await?;
+  // P3 paths: a path's assignment is removed on the Paths tab.
+  let path: Option<Option<Uuid>> = sqlx::query_scalar(
+    "SELECT path_id FROM carehub_learning_assignment WHERE id = $1 AND workspace_id = $2 \
+     FOR UPDATE",
+  )
+  .bind(asg)
+  .bind(c.ws)
+  .fetch_optional(&mut *tx)
+  .await?;
+  if let Some(Some(p)) = path {
+    return Err(path_row(&mut tx, p).await);
+  }
   let course: Option<Uuid> = sqlx::query_scalar(
     "DELETE FROM carehub_learning_assignment WHERE id = $1 AND workspace_id = $2 \
      RETURNING course_id",
@@ -1744,8 +2088,22 @@ async fn assigned(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, 
   let c = ctx(state, user, ws).await?;
   let pool = &state.pg_pool;
   let uid = c.uid();
-  let rows: Vec<(Uuid, Option<i64>, bool, String, i64, i64)> = sqlx::query_as(
-    "SELECT a.course_id, a.due_ms, a.required, a.note, a.updated_ms, s.assigned_ms \
+  #[allow(clippy::type_complexity)]
+  let rows: Vec<(
+    Uuid,
+    Option<i64>,
+    bool,
+    String,
+    i64,
+    i64,
+    Option<i32>,
+    i64,
+    i32,
+    Option<Uuid>,
+    Option<i64>,
+  )> = sqlx::query_as(
+    "SELECT a.course_id, a.due_ms, a.required, a.note, a.updated_ms, s.assigned_ms, \
+       a.due_days, a.days_from_ms, a.tz_minutes, a.path_id, s.renew_due_ms \
      FROM carehub_learning_assignee s \
      JOIN carehub_learning_assignment a ON a.id = s.assignment_id \
      WHERE a.workspace_id = $1 AND s.uid = $2",
@@ -1755,11 +2113,13 @@ async fn assigned(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, 
   .fetch_all(pool)
   .await?;
   let mut eff: HashMap<Uuid, Eff> = HashMap::new();
-  for (course, due_ms, required, note, updated_ms, assigned_ms) in rows {
-    eff
-      .entry(course)
-      .or_insert_with(Eff::new)
-      .add(due_ms, required, &note, updated_ms, assigned_ms);
+  for r in rows {
+    // P1 due_days / P2 recert / P3 paths: (course, due_ms, required, note,
+    // updated_ms, assigned_ms, due_days, days_from_ms, tz, path, renew_due_ms)
+    let due = seat_due(r.1, r.6, r.7, r.8, r.5, r.10);
+    let e = eff.entry(r.0).or_insert_with(Eff::new);
+    e.add(due, r.2, &r.3, r.4, r.5);
+    e.mark(r.9, r.10.is_some());
   }
   if eff.is_empty() {
     return Ok(json!({ "courses": [] }));
@@ -1824,13 +2184,17 @@ async fn assigned(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, 
     out.push(((rank, e.due_ms.unwrap_or(i64::MAX), card.4.to_lowercase()), v));
   }
   out.sort_by(|a, b| a.0.cmp(&b.0));
-  let courses: Vec<Value> = out.into_iter().map(|x| x.1).collect();
+  let mut courses: Vec<Value> = out.into_iter().map(|x| x.1).collect();
+  // P2 recert
+  add_card_expiry(pool, &mut courses).await;
   Ok(json!({ "courses": courses }))
 }
 
 type CertRow = (String, Uuid, String, String, Option<i32>, i64, i32);
 
-fn cert_json(r: &CertRow) -> Value {
+/// P2 recert: `months` = the course's renewal period (the certificate runs out).
+fn cert_json(r: &CertRow, months: Option<i64>, now: i64) -> Value {
+  let expires = months.map(|n| add_months(r.5, n));
   json!({
     "code": r.0,
     "course_id": r.1.to_string(),
@@ -1839,6 +2203,8 @@ fn cert_json(r: &CertRow) -> Value {
     "score": r.4,
     "issued_ms": r.5,
     "version": r.6,
+    "expires_ms": expires,
+    "expired": expires.map(|t| t <= now).unwrap_or(false),
   })
 }
 
@@ -1858,7 +2224,16 @@ async fn my_certificates(state: &AppState, user: &UserUuid, ws: &str) -> Result<
   .bind(c.uid())
   .fetch_all(pool)
   .await?;
-  let list: Vec<Value> = rows.iter().map(cert_json).collect();
+  // P2 recert
+  let mut ids: Vec<Uuid> = rows.iter().map(|r| r.1).collect();
+  ids.sort();
+  ids.dedup();
+  let months = recert_by_course(pool, &ids).await?;
+  let now = now_ms();
+  let list: Vec<Value> = rows
+    .iter()
+    .map(|r| cert_json(r, months.get(&r.1).copied(), now))
+    .collect();
   Ok(json!({ "certificates": list }))
 }
 
@@ -1898,7 +2273,9 @@ async fn verify_certificate(
   .fetch_optional(&state.pg_pool)
   .await?;
   let row = row.ok_or_else(cert_missing)?;
-  Ok(json!({ "certificate": cert_json(&row) }))
+  // P2 recert
+  let months = recert_by_course(&state.pg_pool, &[row.1]).await?;
+  Ok(json!({ "certificate": cert_json(&row, months.get(&row.1).copied(), now_ms()) }))
 }
 
 fn new_code() -> String {
@@ -2434,17 +2811,20 @@ async fn teams(state: &AppState, user: &UserUuid, ws: &str) -> Result<Value, App
 /// overdue reminder handled)
 type PairRow = (Uuid, i64, Option<i64>, i64, bool, i32, bool, bool, bool, bool);
 
-async fn send(pool: &PgPool, uid: i64, body: &str) {
+pub(crate) async fn send(pool: &PgPool, uid: i64, body: &str) {
   if let Err(err) = carehub_extras::notify_user(pool, uid, body).await {
     warn_rarely(&format!("could not send a learning message: {}", err));
   }
 }
 
 /// Marks the person's pending "assigned" rows for a course; returns how many.
+/// P3 paths: direct rows only (a path has its own message).
 async fn claim_assigned(pool: &PgPool, course: Uuid, uid: i64, value: i64) -> Result<u64, AppError> {
   let done = sqlx::query(
-    "UPDATE carehub_learning_assignee SET sent_assigned_ms = $3 \
-     WHERE course_id = $1 AND uid = $2 AND sent_assigned_ms = 0",
+    "UPDATE carehub_learning_assignee s SET sent_assigned_ms = $3 \
+     FROM carehub_learning_assignment a \
+     WHERE a.id = s.assignment_id AND a.path_id IS NULL AND s.course_id = $1 AND s.uid = $2 \
+       AND s.sent_assigned_ms = 0",
   )
   .bind(course)
   .bind(uid)
@@ -2455,7 +2835,9 @@ async fn claim_assigned(pool: &PgPool, course: Uuid, uid: i64, value: i64) -> Re
 }
 
 /// Marks the person's pending due (or overdue) reminder rows for the
-/// assignments with that due date; returns how many.
+/// assignments with that due date; returns how many. P1 due_days: their own
+/// due on each row; P3 paths: path rows too, so one course and date never get
+/// two reminders.
 async fn claim_due(
   pool: &PgPool,
   course: Uuid,
@@ -2464,18 +2846,18 @@ async fn claim_due(
   overdue: bool,
   value: i64,
 ) -> Result<u64, AppError> {
-  let sql = if overdue {
-    "UPDATE carehub_learning_assignee s SET sent_overdue_ms = $4 \
-     FROM carehub_learning_assignment a \
-     WHERE a.id = s.assignment_id AND s.course_id = $1 AND s.uid = $2 AND a.due_ms = $3 \
-       AND s.sent_overdue_ms = 0"
+  let column = if overdue {
+    "sent_overdue_ms"
   } else {
-    "UPDATE carehub_learning_assignee s SET sent_due_ms = $4 \
-     FROM carehub_learning_assignment a \
-     WHERE a.id = s.assignment_id AND s.course_id = $1 AND s.uid = $2 AND a.due_ms = $3 \
-       AND s.sent_due_ms = 0"
+    "sent_due_ms"
   };
-  let done = sqlx::query(sql)
+  let sql = format!(
+    "UPDATE carehub_learning_assignee s SET {column} = $4 \
+     FROM carehub_learning_assignment a \
+     WHERE a.id = s.assignment_id AND s.course_id = $1 AND s.uid = $2 AND {ROW_DUE} = $3 \
+       AND s.{column} = 0"
+  );
+  let done = sqlx::query(&sql)
     .bind(course)
     .bind(uid)
     .bind(due)
@@ -2492,7 +2874,9 @@ async fn claim_due(
 async fn deliver(pool: &PgPool, only: Option<Vec<Uuid>>) -> Result<(), AppError> {
   ready(pool).await?;
   let now = now_ms();
-  let rows: Vec<PairRow> = sqlx::query_as(
+  // P1 due_days: each row's own due; P3 paths: direct rows only (paths remind
+  // about their next course themselves).
+  let sql = format!(
     "SELECT g.course_id, g.uid, g.eff_due, g.first_ms, g.req, g.tz, \
        g.a_done, g.a_pending, g.d_done, g.o_done \
      FROM ( \
@@ -2503,16 +2887,16 @@ async fn deliver(pool: &PgPool, only: Option<Vec<Uuid>>) -> Result<(), AppError>
          COALESCE(BOOL_OR(r.due_ms = r.eff_due AND r.sent_overdue_ms <> 0), FALSE) AS o_done \
        FROM ( \
          SELECT s.course_id, s.uid, s.sent_assigned_ms, s.sent_due_ms, s.sent_overdue_ms, \
-           a.due_ms, MIN(a.due_ms) OVER w AS eff_due, MIN(s.assigned_ms) OVER w AS first_ms, \
-           BOOL_OR(a.required) OVER w AS req, \
+           {ROW_DUE} AS due_ms, MIN({ROW_DUE}) OVER w AS eff_due, \
+           MIN(s.assigned_ms) OVER w AS first_ms, BOOL_OR(a.required) OVER w AS req, \
            FIRST_VALUE(a.tz_minutes) OVER (PARTITION BY s.course_id, s.uid \
-             ORDER BY a.due_ms ASC NULLS LAST) AS tz \
+             ORDER BY {ROW_DUE} ASC NULLS LAST) AS tz \
          FROM carehub_learning_assignee s \
          JOIN carehub_learning_assignment a ON a.id = s.assignment_id \
          JOIN carehub_course c ON c.id = s.course_id \
          JOIN af_workspace_member m ON m.workspace_id = c.workspace_id AND m.uid = s.uid \
          JOIN af_user u ON u.uid = s.uid \
-         WHERE c.status = 'published' AND m.role_id::INT <> $3 \
+         WHERE c.status = 'published' AND m.role_id::INT <> $3 AND a.path_id IS NULL \
            AND COALESCE(u.email, '') NOT LIKE '%.removed-%' \
            AND ($2::UUID[] IS NULL OR s.course_id = ANY($2)) \
          WINDOW w AS (PARTITION BY s.course_id, s.uid) \
@@ -2526,14 +2910,15 @@ async fn deliver(pool: &PgPool, only: Option<Vec<Uuid>>) -> Result<(), AppError>
          / 86400000 - 1) * 86400000 + 32400000 - g.tz::BIGINT * 60000 <= $1) \
        OR (g.eff_due IS NOT NULL AND NOT g.o_done AND ((g.eff_due + g.tz::BIGINT * 60000) \
          / 86400000 + 1) * 86400000 + 32400000 - g.tz::BIGINT * 60000 <= $1) \
-     LIMIT $4",
-  )
-  .bind(now)
-  .bind(only)
-  .bind(guest_role())
-  .bind(TICK_PAIRS)
-  .fetch_all(pool)
-  .await?;
+     LIMIT $4"
+  );
+  let rows: Vec<PairRow> = sqlx::query_as(&sql)
+    .bind(now)
+    .bind(only)
+    .bind(guest_role())
+    .bind(TICK_PAIRS)
+    .fetch_all(pool)
+    .await?;
   if rows.is_empty() {
     return Ok(());
   }
@@ -2617,23 +3002,27 @@ fn calendar_event_id(course: Uuid, uid: i64) -> Uuid {
 async fn sync_calendar(pool: &PgPool, only: Option<Vec<Uuid>>) -> Result<(), AppError> {
   ready(pool).await?;
   carehub_calendar::ensure_tables(pool).await?;
-  let want: Vec<(Uuid, i64, Uuid, i64, i32)> = sqlx::query_as(
-    "SELECT DISTINCT ON (s.course_id, s.uid) s.course_id, s.uid, c.workspace_id, a.due_ms, \
-       a.tz_minutes \
+  // P1 due_days: each row's own due; P3 paths: direct rows only (a path has
+  // one entry per person, carehub_learning_paths.rs).
+  let sql = format!(
+    "SELECT DISTINCT ON (s.course_id, s.uid) s.course_id, s.uid, c.workspace_id, \
+       {ROW_DUE} AS due, a.tz_minutes \
      FROM carehub_learning_assignee s \
      JOIN carehub_learning_assignment a ON a.id = s.assignment_id \
      JOIN carehub_course c ON c.id = s.course_id \
      JOIN af_workspace_member m ON m.workspace_id = c.workspace_id AND m.uid = s.uid \
      JOIN af_user u ON u.uid = s.uid \
-     WHERE a.calendar AND a.due_ms IS NOT NULL AND c.status = 'published' \
+     WHERE a.calendar AND a.path_id IS NULL AND {ROW_DUE} IS NOT NULL \
+       AND c.status = 'published' \
        AND m.role_id::INT <> $1 AND COALESCE(u.email, '') NOT LIKE '%.removed-%' \
        AND ($2::UUID[] IS NULL OR s.course_id = ANY($2)) \
-     ORDER BY s.course_id, s.uid, a.due_ms ASC",
-  )
-  .bind(guest_role())
-  .bind(only.clone())
-  .fetch_all(pool)
-  .await?;
+     ORDER BY s.course_id, s.uid, due ASC"
+  );
+  let want: Vec<(Uuid, i64, Uuid, i64, i32)> = sqlx::query_as(&sql)
+    .bind(guest_role())
+    .bind(only.clone())
+    .fetch_all(pool)
+    .await?;
   let have: Vec<(Uuid, i64, Uuid, i64)> = sqlx::query_as(
     "SELECT course_id, uid, event_id, start_ms FROM carehub_learning_calendar \
      WHERE ($1::UUID[] IS NULL OR course_id = ANY($1))",
@@ -2735,6 +3124,730 @@ async fn sync_calendar(pool: &PgPool, only: Option<Vec<Uuid>>) -> Result<(), App
 }
 
 // ---------------------------------------------------------------------------
+// P2 recert: finishes that run out (heads-up, progress reset, renewal due)
+// ---------------------------------------------------------------------------
+
+/// settings.recert_months: missing / null = never, else 1-60 whole months.
+fn recert_value(v: Option<&Value>) -> Result<Option<i64>, &'static str> {
+  match v {
+    None | Some(Value::Null) => Ok(None),
+    Some(x) => x
+      .as_i64()
+      .or_else(|| {
+        x.as_f64()
+          .filter(|f| f.is_finite() && f.fract().abs() < 1e-9 && f.abs() < 1e9)
+          .map(|f| f as i64)
+      })
+      .filter(|n| (1..=MAX_RECERT_MONTHS).contains(n))
+      .map(Some)
+      .ok_or(RECERT_MSG),
+  }
+}
+
+/// The publish check (carehub_learning.rs publish_problems).
+pub(crate) fn recert_problem(settings: &Value) -> Option<&'static str> {
+  recert_value(settings.get("recert_months")).err()
+}
+
+/// Renewal months of published versions, cached like CERT_FLAGS (versions
+/// never change); an invalid stored value counts as never.
+async fn recert_for(pool: &PgPool, live: &[(Uuid, i32)]) -> Result<HashMap<Uuid, i64>, AppError> {
+  let mut out: HashMap<Uuid, i64> = HashMap::new();
+  let mut ask_courses: Vec<Uuid> = Vec::new();
+  let mut ask_versions: Vec<i32> = Vec::new();
+  for key in live {
+    let known = RECERT.lock().ok().and_then(|m| m.get(key).copied());
+    match known {
+      Some(Some(n)) => {
+        out.insert(key.0, n);
+      },
+      Some(None) => {},
+      None => {
+        ask_courses.push(key.0);
+        ask_versions.push(key.1);
+      },
+    }
+  }
+  if ask_courses.is_empty() {
+    return Ok(out);
+  }
+  let rows: Vec<(Uuid, i32, Option<String>)> = sqlx::query_as(
+    "SELECT v.course_id, v.version, (v.content->'settings'->'recert_months')::TEXT \
+     FROM carehub_course_version v \
+     JOIN UNNEST($1::UUID[], $2::INT[]) AS w(course_id, version) \
+       ON w.course_id = v.course_id AND w.version = v.version",
+  )
+  .bind(ask_courses)
+  .bind(ask_versions)
+  .fetch_all(pool)
+  .await?;
+  for (course, version, raw) in rows {
+    let value: Option<Value> = raw.and_then(|s| serde_json::from_str(&s).ok());
+    let months = recert_value(value.as_ref()).ok().flatten();
+    if let Ok(mut m) = RECERT.lock() {
+      m.insert((course, version), months);
+    }
+    if let Some(n) = months {
+      out.insert(course, n);
+    }
+  }
+  Ok(out)
+}
+
+/// Renewal months by course (latest published version, archived included).
+async fn recert_by_course(pool: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, i64>, AppError> {
+  if ids.is_empty() {
+    return Ok(HashMap::new());
+  }
+  let live: Vec<(Uuid, i32)> = sqlx::query_as(
+    "SELECT id, published_version FROM carehub_course \
+     WHERE id = ANY($1) AND published_version IS NOT NULL",
+  )
+  .bind(ids.to_vec())
+  .fetch_all(pool)
+  .await?;
+  recert_for(pool, &live).await
+}
+
+/// Day number of a (year, month 1-12, day) date (civil_from_days reversed).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+  let y = if m <= 2 { y - 1 } else { y };
+  let era = y.div_euclid(400);
+  let yoe = y.rem_euclid(400);
+  let mp = if m > 2 { m - 3 } else { m + 9 };
+  let doy = (153 * mp + 2) / 5 + d - 1;
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  era * 146_097 + doe - 719_468
+}
+
+/// `ms` plus whole calendar months: UTC, same time of day, the day clamped to
+/// the month's end (31 Jan + 1 month = 28 / 29 Feb).
+pub(crate) fn add_months(ms: i64, months: i64) -> i64 {
+  let (y, m, d) = civil_from_days(ms.div_euclid(DAY_MS));
+  let index = y * 12 + (m - 1) + months;
+  let (y2, m2) = (index.div_euclid(12), index.rem_euclid(12) + 1);
+  let (y3, m3) = if m2 == 12 { (y2 + 1, 1) } else { (y2, m2 + 1) };
+  let last = days_from_civil(y3, m3, 1) - days_from_civil(y2, m2, 1);
+  days_from_civil(y2, m2, d.min(last)) * DAY_MS + ms.rem_euclid(DAY_MS)
+}
+
+fn heads_up_days(months: i64) -> i64 {
+  if months == 1 {
+    HEADS_UP_DAYS_MONTHLY
+  } else {
+    HEADS_UP_DAYS
+  }
+}
+
+/// 09:00 local, HEADS_UP_DAYS before the local day a finish runs out.
+fn heads_up_at(expires: i64, months: i64, tz: i32) -> i64 {
+  day_start(local_day(expires, tz) - heads_up_days(months), tz) + REMIND_HOUR * HOUR_MS
+}
+
+/// 23:59:59.999 local, RENEW_DAYS after the day of the renewal.
+fn renewal_due(now: i64, tz: i32) -> i64 {
+  day_start(local_day(now, tz) + RENEW_DAYS + 1, tz) - 1
+}
+
+/// Finishes from before this may need a heads-up or a renewal now: N months
+/// are at least 28·N days and a heads-up comes less than heads_up_days + 1
+/// days before the end (one day spare).
+fn recert_cutoff(now: i64, months: i64) -> i64 {
+  now - (months * 28 - heads_up_days(months) - 2) * DAY_MS
+}
+
+/// expires_ms / expired on one progress object (status + completed_ms).
+fn put_row_expiry(row: &mut Value, months: Option<i64>, now: i64) {
+  let expires = if finished(txt(row, "status")) {
+    row
+      .get("completed_ms")
+      .and_then(|t| t.as_i64())
+      .and_then(|t| months.map(|n| add_months(t, n)))
+  } else {
+    None
+  };
+  if let Some(o) = row.as_object_mut() {
+    o.insert("expires_ms".to_string(), json!(expires));
+    o.insert(
+      "expired".to_string(),
+      json!(expires.map(|t| t <= now).unwrap_or(false)),
+    );
+  }
+}
+
+/// Course cards (Phase 1 /catalog and /my, /assigned): expires_ms / expired on
+/// `my`. Never fails the request (on a database error the fields are left out).
+pub(crate) async fn add_card_expiry(pool: &PgPool, cards: &mut [Value]) {
+  let mut ids: Vec<Uuid> = cards
+    .iter()
+    .filter_map(|c| Uuid::parse_str(txt(c, "id")).ok())
+    .collect();
+  ids.sort();
+  ids.dedup();
+  let months = match recert_by_course(pool, &ids).await {
+    Ok(m) => m,
+    Err(err) => {
+      warn_rarely(&format!("renewal dates: {}", err));
+      return;
+    },
+  };
+  let now = now_ms();
+  for card in cards.iter_mut() {
+    let n = Uuid::parse_str(txt(card, "id"))
+      .ok()
+      .and_then(|c| months.get(&c).copied());
+    if let Some(my) = card.get_mut("my") {
+      put_row_expiry(my, n, now);
+    }
+  }
+}
+
+fn row_course(row: &Value, course: Option<Uuid>) -> Option<Uuid> {
+  course.or_else(|| Uuid::parse_str(txt(row, "course_id")).ok())
+}
+
+/// Progress rows of one course (`course`) or with a course_id each: report
+/// rows and the Player's enrollment. Never fails the request.
+pub(crate) async fn add_row_expiry(pool: &PgPool, rows: &mut [Value], course: Option<Uuid>) {
+  let mut ids: Vec<Uuid> = rows.iter().filter_map(|r| row_course(r, course)).collect();
+  ids.sort();
+  ids.dedup();
+  let months = match recert_by_course(pool, &ids).await {
+    Ok(m) => m,
+    Err(err) => {
+      warn_rarely(&format!("renewal dates: {}", err));
+      return;
+    },
+  };
+  let now = now_ms();
+  for row in rows.iter_mut() {
+    let n = row_course(row, course).and_then(|c| months.get(&c).copied());
+    put_row_expiry(row, n, now);
+  }
+}
+
+/// want_for for one person.
+fn covers(kind: &str, id: &str, uid: i64, people: &People, groups: &[Group]) -> bool {
+  if !people.has(uid) {
+    return false;
+  }
+  match kind {
+    "person" => id.parse::<i64>().map(|x| x == uid).unwrap_or(false),
+    "role" => people.get(uid).map(|p| p.role_id == id).unwrap_or(false),
+    "everyone" => true,
+    "group" => Uuid::parse_str(id)
+      .ok()
+      .and_then(|g| groups.iter().find(|x| x.id == g))
+      .map(|g| g.members.contains(&uid))
+      .unwrap_or(false),
+    _ => false,
+  }
+}
+
+/// Someone's rows on one course: `keep` = their target covers them now (they
+/// are assigned), `stale` = kept only because they had finished.
+struct Cover {
+  keep: Vec<Uuid>,
+  stale: Vec<Uuid>,
+  /// Earliest assigned_ms of a covering row.
+  first_ms: i64,
+  /// The time zone of their reminders (the covering row with the earliest due).
+  tz: i32,
+  rank: Option<(bool, i64)>,
+}
+
+impl Cover {
+  fn new() -> Cover {
+    Cover {
+      keep: Vec::new(),
+      stale: Vec::new(),
+      first_ms: i64::MAX,
+      tz: 0,
+      rank: None,
+    }
+  }
+
+  fn add(&mut self, asg: Uuid, covering: bool, assigned_ms: i64, tz: i32, due: Option<i64>) {
+    if covering {
+      self.keep.push(asg);
+      self.first_ms = self.first_ms.min(assigned_ms);
+    } else {
+      self.stale.push(asg);
+    }
+    let rank = (!covering, due.unwrap_or(i64::MAX));
+    if self.rank.map(|r| rank < r).unwrap_or(true) {
+      self.rank = Some(rank);
+      self.tz = tz;
+    }
+  }
+}
+
+/// The rows of some (course, person) pairs of one workspace.
+async fn covers_of(
+  pool: &PgPool,
+  pairs: &[(Uuid, i64)],
+  people: &People,
+  groups: &[Group],
+) -> Result<HashMap<(Uuid, i64), Cover>, AppError> {
+  let courses: Vec<Uuid> = pairs.iter().map(|p| p.0).collect();
+  let uids: Vec<i64> = pairs.iter().map(|p| p.1).collect();
+  let sql = format!(
+    "SELECT s.course_id, s.uid, a.id, a.target_kind, a.target_id, s.assigned_ms, \
+       a.tz_minutes, {ROW_DUE} \
+     FROM UNNEST($1::UUID[], $2::BIGINT[]) AS w(course_id, uid) \
+     JOIN carehub_learning_assignee s ON s.course_id = w.course_id AND s.uid = w.uid \
+     JOIN carehub_learning_assignment a ON a.id = s.assignment_id"
+  );
+  #[allow(clippy::type_complexity)]
+  let rows: Vec<(Uuid, i64, Uuid, String, String, i64, i32, Option<i64>)> = sqlx::query_as(&sql)
+    .bind(courses)
+    .bind(uids)
+    .fetch_all(pool)
+    .await?;
+  let mut out: HashMap<(Uuid, i64), Cover> = HashMap::new();
+  for (course, uid, asg, kind, target, assigned_ms, tz, due) in rows {
+    let covering = covers(&kind, &target, uid, people, groups);
+    out
+      .entry((course, uid))
+      .or_insert_with(Cover::new)
+      .add(asg, covering, assigned_ms, tz, due);
+  }
+  Ok(out)
+}
+
+/// One finish that can run out.
+struct Finish {
+  course: Uuid,
+  uid: i64,
+  ws: Uuid,
+  completed_ms: i64,
+  months: i64,
+  expires: i64,
+}
+
+/// How a renewal went.
+enum Renewal {
+  /// Nothing to do any more (reset, finished again, or renewed already).
+  Gone,
+  /// Progress reset only: assigned after it ran out (their own due applies).
+  Reset,
+  /// Progress reset with a renewal due.
+  Due(i64),
+}
+
+/// Remembers when to look at a finish again.
+async fn put_expiry(pool: &PgPool, f: &Finish, wake: i64) -> Result<(), AppError> {
+  sqlx::query(
+    "INSERT INTO carehub_learning_renewal \
+       (course_id, uid, finished_ms, workspace_id, months, expires_ms, wake_ms) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+     ON CONFLICT (course_id, uid, finished_ms) DO UPDATE SET months = EXCLUDED.months, \
+       expires_ms = EXCLUDED.expires_ms, wake_ms = EXCLUDED.wake_ms \
+     WHERE carehub_learning_renewal.renewed_ms = 0",
+  )
+  .bind(f.course)
+  .bind(f.uid)
+  .bind(f.completed_ms)
+  .bind(f.ws)
+  .bind(f.months)
+  .bind(f.expires)
+  .bind(wake)
+  .execute(pool)
+  .await?;
+  Ok(())
+}
+
+/// Locks their enrollment; while it is still this finish, the data of the
+/// "reset" event that ends it.
+async fn still_finished(
+  conn: &mut PgConnection,
+  f: &Finish,
+  by: &str,
+) -> Result<Option<Value>, AppError> {
+  let enr: Option<(String, Option<i64>, Option<i32>, i32)> = sqlx::query_as(
+    "SELECT status, completed_ms, score, version FROM carehub_enrollment \
+     WHERE course_id = $1 AND uid = $2 FOR UPDATE",
+  )
+  .bind(f.course)
+  .bind(f.uid)
+  .fetch_optional(&mut *conn)
+  .await?;
+  Ok(match enr {
+    Some((status, Some(t), score, version)) if t == f.completed_ms && finished(&status) => {
+      Some(json!({
+        "by": by,
+        "completed_ms": t,
+        "status": status,
+        "score": score,
+        "version": version,
+      }))
+    },
+    _ => None,
+  })
+}
+
+/// Their rows that no longer cover them (a sync would remove them now that
+/// they are unfinished).
+async fn drop_rows(conn: &mut PgConnection, f: &Finish, cover: &Cover) -> Result<(), AppError> {
+  if cover.stale.is_empty() {
+    return Ok(());
+  }
+  sqlx::query(
+    "DELETE FROM carehub_learning_assignee \
+     WHERE course_id = $1 AND uid = $2 AND assignment_id = ANY($3)",
+  )
+  .bind(f.course)
+  .bind(f.uid)
+  .bind(cover.stale.clone())
+  .execute(&mut *conn)
+  .await?;
+  Ok(())
+}
+
+/// Renews the finish of an assigned person: the certificate for it first, then
+/// in one transaction the claim, the progress reset (the existing reset path),
+/// their other rows removed and, when they were assigned before it ran out, the
+/// renewal due on the rest (reminders re-armed, a pending "New course" message
+/// marked done); the message after the commit.
+async fn renew(
+  pool: &PgPool,
+  f: &Finish,
+  cover: &Cover,
+  title: &str,
+  now: i64,
+) -> Result<Renewal, AppError> {
+  issue_certificates(pool, Some(f.ws), Some(f.uid), Some(f.course)).await?;
+  let full = cover.first_ms < f.expires;
+  let due = renewal_due(now, cover.tz);
+  let mut tx = pool.begin().await?;
+  lock_ws(&mut tx, f.ws).await?;
+  let data = match still_finished(&mut tx, f, "renewal").await? {
+    Some(d) => d,
+    None => return Ok(Renewal::Gone),
+  };
+  let claimed = sqlx::query(
+    "INSERT INTO carehub_learning_renewal (course_id, uid, finished_ms, workspace_id, months, \
+       expires_ms, wake_ms, renewed_ms, due_ms) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8) \
+     ON CONFLICT (course_id, uid, finished_ms) DO UPDATE SET months = EXCLUDED.months, \
+       expires_ms = EXCLUDED.expires_ms, wake_ms = EXCLUDED.wake_ms, \
+       renewed_ms = EXCLUDED.renewed_ms, due_ms = EXCLUDED.due_ms \
+     WHERE carehub_learning_renewal.renewed_ms = 0",
+  )
+  .bind(f.course)
+  .bind(f.uid)
+  .bind(f.completed_ms)
+  .bind(f.ws)
+  .bind(f.months)
+  .bind(f.expires)
+  .bind(now)
+  .bind(full.then_some(due))
+  .execute(&mut *tx)
+  .await?;
+  if claimed.rows_affected() == 0 {
+    return Ok(Renewal::Gone);
+  }
+  carehub_learning::reset_progress(&mut tx, f.ws, f.course, f.uid, data).await?;
+  drop_rows(&mut tx, f, cover).await?;
+  if full {
+    sqlx::query(
+      "UPDATE carehub_learning_assignee SET renew_due_ms = $3, sent_due_ms = 0, \
+         sent_overdue_ms = 0, \
+         sent_assigned_ms = CASE WHEN sent_assigned_ms = 0 THEN -1 ELSE sent_assigned_ms END \
+       WHERE course_id = $1 AND uid = $2",
+    )
+    .bind(f.course)
+    .bind(f.uid)
+    .bind(due)
+    .execute(&mut *tx)
+    .await?;
+  }
+  tx.commit().await?;
+  if !full {
+    return Ok(Renewal::Reset);
+  }
+  let body = format!(
+    "🔁 Time to renew “{}”. Please take it again by {}.\n{}",
+    title,
+    day_label(local_day(due, cover.tz)),
+    course_link(f.course)
+  );
+  send(pool, f.uid, &body).await;
+  Ok(Renewal::Due(due))
+}
+
+/// The heads-up for one finish (claimed first, so it goes out once).
+async fn heads_up(
+  pool: &PgPool,
+  f: &Finish,
+  tz: i32,
+  title: &str,
+  now: i64,
+) -> Result<(), AppError> {
+  let cert: Option<i32> = sqlx::query_scalar(
+    "SELECT 1 FROM carehub_learning_certificate \
+     WHERE course_id = $1 AND uid = $2 AND issued_ms = $3",
+  )
+  .bind(f.course)
+  .bind(f.uid)
+  .bind(f.completed_ms)
+  .fetch_optional(pool)
+  .await?;
+  let claimed = sqlx::query(
+    "INSERT INTO carehub_learning_renewal (course_id, uid, finished_ms, workspace_id, months, \
+       expires_ms, wake_ms, heads_up_ms) \
+     VALUES ($1, $2, $3, $4, $5, $6, $6, $7) \
+     ON CONFLICT (course_id, uid, finished_ms) DO UPDATE SET months = EXCLUDED.months, \
+       expires_ms = EXCLUDED.expires_ms, wake_ms = EXCLUDED.wake_ms, \
+       heads_up_ms = EXCLUDED.heads_up_ms \
+     WHERE carehub_learning_renewal.heads_up_ms = 0 AND carehub_learning_renewal.renewed_ms = 0",
+  )
+  .bind(f.course)
+  .bind(f.uid)
+  .bind(f.completed_ms)
+  .bind(f.ws)
+  .bind(f.months)
+  .bind(f.expires)
+  .bind(now)
+  .execute(pool)
+  .await?;
+  if claimed.rows_affected() == 0 {
+    return Ok(());
+  }
+  let what = if cert.is_some() {
+    "certificate"
+  } else {
+    "training"
+  };
+  let body = format!(
+    "🔁 Your “{}” {} runs out on {}. You'll be asked to take the course again.\n{}",
+    title,
+    what,
+    day_label(local_day(f.expires, tz)),
+    course_link(f.course)
+  );
+  send(pool, f.uid, &body).await;
+  Ok(())
+}
+
+/// What one finish needs now: run out → renewal (assigned) or a look again in
+/// a while; heads-up time not reached (or heads-up sent) → wait for it / for
+/// the end; else the heads-up (assigned) or a look again in a while.
+async fn look_at(
+  pool: &PgPool,
+  f: &Finish,
+  heads_up_ms: i64,
+  cover: Option<&Cover>,
+  titles: &HashMap<Uuid, String>,
+  now: i64,
+) -> Result<(), AppError> {
+  let assigned = cover.filter(|c| !c.keep.is_empty());
+  let tz = cover.map(|c| c.tz).unwrap_or(0);
+  let title = titles
+    .get(&f.course)
+    .map(|t| t.as_str())
+    .unwrap_or("Untitled course");
+  if f.expires <= now {
+    return match assigned {
+      Some(c) => {
+        renew(pool, f, c, title, now).await?;
+        Ok(())
+      },
+      None => put_expiry(pool, f, now + RECHECK_MS).await,
+    };
+  }
+  let at = heads_up_at(f.expires, f.months, tz);
+  if heads_up_ms != 0 || now < at {
+    let wake = if heads_up_ms == 0 { at } else { f.expires };
+    return put_expiry(pool, f, wake).await;
+  }
+  if assigned.is_none() {
+    return put_expiry(pool, f, f.expires.min(now + RECHECK_MS)).await;
+  }
+  heads_up(pool, f, tz, title, now).await
+}
+
+/// Heads-ups and renewals that are due, at most RENEW_BATCH per run (the
+/// longest waiting first). `only` (after an assignment change): those courses,
+/// every finish looked at again (someone may have just been assigned).
+pub(crate) async fn renewals(pool: &PgPool, only: Option<&[Uuid]>) -> Result<(), AppError> {
+  ready(pool).await?;
+  let now = now_ms();
+  let live: Vec<(Uuid, i32)> = sqlx::query_as(
+    "SELECT id, published_version FROM carehub_course \
+     WHERE status = 'published' AND published_version IS NOT NULL \
+       AND ($1::UUID[] IS NULL OR id = ANY($1))",
+  )
+  .bind(only.map(|x| x.to_vec()))
+  .fetch_all(pool)
+  .await?;
+  let months = recert_for(pool, &live).await?;
+  if months.is_empty() {
+    return Ok(());
+  }
+  let mut courses: Vec<Uuid> = Vec::new();
+  let mut lengths: Vec<i64> = Vec::new();
+  let mut cutoffs: Vec<i64> = Vec::new();
+  for (course, n) in &months {
+    courses.push(*course);
+    lengths.push(*n);
+    cutoffs.push(recert_cutoff(now, *n));
+  }
+  let rows: Vec<(Uuid, i64, Uuid, i64, i64, i64)> = sqlx::query_as(
+    "SELECT e.course_id, e.uid, c.workspace_id, e.completed_ms, w.months, \
+       COALESCE(r.heads_up_ms, 0) \
+     FROM UNNEST($1::UUID[], $2::BIGINT[], $3::BIGINT[]) AS w(course_id, months, cutoff) \
+     JOIN carehub_course c ON c.id = w.course_id \
+     JOIN carehub_enrollment e ON e.course_id = w.course_id \
+     JOIN af_workspace_member m ON m.workspace_id = c.workspace_id AND m.uid = e.uid \
+     JOIN af_user u ON u.uid = e.uid \
+     LEFT JOIN carehub_learning_renewal r ON r.course_id = e.course_id AND r.uid = e.uid \
+       AND r.finished_ms = e.completed_ms \
+     WHERE c.status = 'published' AND e.status IN ('completed', 'passed') \
+       AND e.completed_ms IS NOT NULL AND e.completed_ms < w.cutoff \
+       AND m.role_id::INT <> $4 AND COALESCE(u.email, '') NOT LIKE '%.removed-%' \
+       AND COALESCE(r.renewed_ms, 0) = 0 \
+       AND ($5 OR r.course_id IS NULL OR r.months <> w.months OR r.wake_ms <= $6) \
+       AND EXISTS (SELECT 1 FROM carehub_learning_assignee s \
+         WHERE s.course_id = e.course_id AND s.uid = e.uid) \
+     ORDER BY COALESCE(r.wake_ms, 0) \
+     LIMIT $7",
+  )
+  .bind(courses)
+  .bind(lengths)
+  .bind(cutoffs)
+  .bind(guest_role())
+  .bind(only.is_some())
+  .bind(now)
+  .bind(RENEW_BATCH)
+  .fetch_all(pool)
+  .await?;
+  if rows.is_empty() {
+    return Ok(());
+  }
+  // Per workspace: people and groups are loaded once.
+  let mut by_ws: BTreeMap<Uuid, Vec<(Finish, i64)>> = BTreeMap::new();
+  for (course, uid, ws, completed_ms, n, heads_up_ms) in rows {
+    let f = Finish {
+      course,
+      uid,
+      ws,
+      completed_ms,
+      months: n,
+      expires: add_months(completed_ms, n),
+    };
+    by_ws.entry(ws).or_default().push((f, heads_up_ms));
+  }
+  let mut ids: Vec<Uuid> = by_ws.values().flatten().map(|x| x.0.course).collect();
+  ids.sort();
+  ids.dedup();
+  let titles = titles_of(pool, &ids).await?;
+  for (ws, todo) in by_ws {
+    let people = people_of(pool, ws).await?;
+    let mut conn = pool.acquire().await?;
+    let groups = groups_of(&mut conn, ws).await?;
+    drop(conn);
+    let pairs: Vec<(Uuid, i64)> = todo.iter().map(|x| (x.0.course, x.0.uid)).collect();
+    let covers = covers_of(pool, &pairs, &people, &groups).await?;
+    for (f, heads_up_ms) in &todo {
+      let cover = covers.get(&(f.course, f.uid));
+      if let Err(err) = look_at(pool, f, *heads_up_ms, cover, &titles, now).await {
+        warn_rarely(&format!("renewal: {}", err));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// A renewal due ends once they finish again (their rows go back to their own
+/// due).
+async fn end_renewal_dues(pool: &PgPool) -> Result<(), AppError> {
+  sqlx::query(
+    "UPDATE carehub_learning_assignee s SET renew_due_ms = NULL \
+     WHERE s.renew_due_ms IS NOT NULL AND EXISTS (SELECT 1 FROM carehub_enrollment e \
+       WHERE e.course_id = s.course_id AND e.uid = s.uid AND e.status IN ('completed', 'passed'))",
+  )
+  .execute(pool)
+  .await?;
+  Ok(())
+}
+
+/// POST /courses/{id}/retake: once my latest finish has run out. Assigned →
+/// the renewal now (renewal due + message); not assigned → a plain reset.
+async fn retake(state: &AppState, user: &UserUuid, ws: &str, id: &str) -> Result<Value, AppError> {
+  let c = ctx(state, user, ws).await?;
+  let course = parse_uuid(id, COURSE_LINK_MSG)?;
+  let pool = &state.pg_pool;
+  let uid = c.uid();
+  let status: Option<String> =
+    sqlx::query_scalar("SELECT status FROM carehub_course WHERE id = $1 AND workspace_id = $2")
+      .bind(course)
+      .bind(c.ws)
+      .fetch_optional(pool)
+      .await?;
+  if status.ok_or_else(missing)? != "published" {
+    return Err(bad(RETAKE_MSG));
+  }
+  let months = recert_by_course(pool, &[course])
+    .await?
+    .get(&course)
+    .copied()
+    .ok_or_else(|| bad(RETAKE_MSG))?;
+  let enr: Option<(String, Option<i64>)> = sqlx::query_as(
+    "SELECT status, completed_ms FROM carehub_enrollment WHERE course_id = $1 AND uid = $2",
+  )
+  .bind(course)
+  .bind(uid)
+  .fetch_optional(pool)
+  .await?;
+  let completed_ms = match enr {
+    Some((s, Some(t))) if finished(&s) => t,
+    _ => return Err(bad(RETAKE_MSG)),
+  };
+  let now = now_ms();
+  let f = Finish {
+    course,
+    uid,
+    ws: c.ws,
+    completed_ms,
+    months,
+    expires: add_months(completed_ms, months),
+  };
+  if f.expires > now {
+    return Err(bad(RETAKE_MSG));
+  }
+  let people = people_of(pool, c.ws).await?;
+  let mut conn = pool.acquire().await?;
+  let groups = groups_of(&mut conn, c.ws).await?;
+  drop(conn);
+  let covers = covers_of(pool, &[(course, uid)], &people, &groups).await?;
+  let none = Cover::new();
+  let cover = covers.get(&(course, uid)).unwrap_or(&none);
+  let due = if cover.keep.is_empty() {
+    let mut tx = pool.begin().await?;
+    lock_ws(&mut tx, c.ws).await?;
+    if let Some(data) = still_finished(&mut tx, &f, "self").await? {
+      carehub_learning::reset_progress(&mut tx, c.ws, course, uid, data).await?;
+      drop_rows(&mut tx, &f, cover).await?;
+      tx.commit().await?;
+    }
+    None
+  } else {
+    let titles = titles_of(pool, &[course]).await?;
+    let title = titles
+      .get(&course)
+      .map(|t| t.as_str())
+      .unwrap_or("Untitled course");
+    match renew(pool, &f, cover, title, now).await? {
+      Renewal::Due(d) => Some(d),
+      Renewal::Reset | Renewal::Gone => None,
+    }
+  };
+  after_change(pool, vec![course]);
+  Ok(json!({ "ok": true, "renewed": due.is_some(), "due_ms": due }))
+}
+
+// ---------------------------------------------------------------------------
 // Background task
 // ---------------------------------------------------------------------------
 
@@ -2816,11 +3929,22 @@ async fn tick(pool: &PgPool) -> Result<(), AppError> {
       warn_rarely(&format!("could not refresh assignments: {}", err));
     }
   }
+  // P2 recert: renewal dues end once they finish again; then heads-ups and renewals.
+  if let Err(err) = end_renewal_dues(pool).await {
+    warn_rarely(&format!("renewal dues: {}", err));
+  }
+  if let Err(err) = renewals(pool, None).await {
+    warn_rarely(&format!("renewals: {}", err));
+  }
   if let Err(err) = deliver(pool, None).await {
     warn_rarely(&format!("reminders: {}", err));
   }
   if let Err(err) = sync_calendar(pool, None).await {
     warn_rarely(&format!("calendar entries: {}", err));
+  }
+  // P3 paths
+  if let Err(err) = carehub_learning_paths::tick_paths(pool).await {
+    warn_rarely(&format!("learning paths: {}", err));
   }
   if let Err(err) = issue_certificates(pool, None, None, None).await {
     warn_rarely(&format!("certificates: {}", err));
@@ -2966,6 +4090,16 @@ async fn insights_handler(
   reply(insights(&state, &user, &ws, &id).await)
 }
 
+/// P2 recert
+async fn retake_handler(
+  user: UserUuid,
+  state: Data<AppState>,
+  path: web::Path<(String, String)>,
+) -> Reply {
+  let (ws, id) = path.into_inner();
+  reply(retake(&state, &user, &ws, &id).await)
+}
+
 async fn teams_handler(user: UserUuid, state: Data<AppState>, path: web::Path<String>) -> Reply {
   let ws = path.into_inner();
   reply(teams(&state, &user, &ws).await)
@@ -3016,5 +4150,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/carehub/ws/{ws}/learning/reports/teams")
         .route(web::get().to(teams_handler)),
+    )
+    // P2 recert
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/courses/{id}/retake")
+        .route(web::post().to(retake_handler)),
     );
+  // P3 paths
+  carehub_learning_paths::configure(cfg);
 }

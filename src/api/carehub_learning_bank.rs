@@ -116,7 +116,72 @@ async fn create_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
   for sql in TABLES {
     sqlx::query(sql).execute(&mut *tx).await?;
   }
-  tx.commit().await
+  tx.commit().await?;
+  if let Err(err) = link_survey_answers(pool).await {
+    tracing::warn!(
+      "carehub learning bank: could not link survey answers to courses: {}",
+      err
+    );
+  }
+  Ok(())
+}
+
+/// Survey answers go away with their course. If the foreign key isn't there yet
+/// (looked up by name): removes answers whose course is already gone, then adds
+/// course_id -> carehub_course (id) ON DELETE CASCADE. Both tables are locked
+/// first (waiting 5 s at most), so no course can be deleted in between. Safe to
+/// run again; a failure is only logged and rolls both steps back (surveys keep
+/// working without the key; the next start tries again).
+async fn link_survey_answers(pool: &PgPool) -> Result<(), sqlx::Error> {
+  let mut tx = pool.begin().await?;
+  sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    .bind(TABLE_LOCK_KEY)
+    .execute(&mut *tx)
+    .await?;
+  // A row only when both tables exist and the key (by name) isn't there yet.
+  let needed = sqlx::query(
+    "SELECT 1 WHERE to_regclass('carehub_course') IS NOT NULL \
+       AND to_regclass('carehub_survey_answer') IS NOT NULL \
+       AND NOT EXISTS (SELECT 1 FROM pg_constraint \
+         WHERE conname = 'carehub_survey_answer_course_id_fkey' \
+           AND conrelid = to_regclass('carehub_survey_answer'))",
+  )
+  .fetch_optional(&mut *tx)
+  .await?
+  .is_some();
+  if !needed {
+    return tx.commit().await;
+  }
+  sqlx::query("SET LOCAL lock_timeout = '5s'")
+    .execute(&mut *tx)
+    .await?;
+  sqlx::query(
+    "LOCK TABLE carehub_course, carehub_survey_answer IN SHARE ROW EXCLUSIVE MODE",
+  )
+  .execute(&mut *tx)
+  .await?;
+  let removed = sqlx::query(
+    "DELETE FROM carehub_survey_answer a \
+     WHERE NOT EXISTS (SELECT 1 FROM carehub_course c WHERE c.id = a.course_id)",
+  )
+  .execute(&mut *tx)
+  .await?
+  .rows_affected();
+  sqlx::query(
+    "ALTER TABLE carehub_survey_answer \
+     ADD CONSTRAINT carehub_survey_answer_course_id_fkey \
+     FOREIGN KEY (course_id) REFERENCES carehub_course (id) ON DELETE CASCADE",
+  )
+  .execute(&mut *tx)
+  .await?;
+  tx.commit().await?;
+  if removed > 0 {
+    tracing::info!(
+      "carehub learning bank: removed {} survey answers of deleted courses",
+      removed
+    );
+  }
+  Ok(())
 }
 
 // ---------------------------------------------------------------------------

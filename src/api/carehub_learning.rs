@@ -10,6 +10,7 @@
 //! `learning_analytics`. `admin` implies both.
 
 use crate::api::carehub_extras::{me_in, Me};
+use crate::api::carehub_learning_assign; // paths3 (P2 recert): hooks below
 use crate::api::carehub_learning_bank as qbank; // qbank3: hooks below
 use crate::biz::authentication::jwt::UserUuid;
 use crate::state::AppState;
@@ -1651,7 +1652,9 @@ async fn course_cards(
   } else {
     picked.sort_by(|a, b| a.0 .4.to_lowercase().cmp(&b.0 .4.to_lowercase()));
   }
-  let courses: Vec<Value> = picked.iter().map(|(card, my)| card_json(card, *my)).collect();
+  let mut courses: Vec<Value> = picked.iter().map(|(card, my)| card_json(card, *my)).collect();
+  // P2 recert
+  carehub_learning_assign::add_card_expiry(&state.pg_pool, &mut courses).await;
   Ok(json!({ "courses": courses }))
 }
 
@@ -1708,10 +1711,15 @@ async fn play(state: &AppState, user: &UserUuid, ws: &str, id: &str) -> Result<V
   }
   let mut res = Map::new();
   res.insert("course".to_string(), out);
-  res.insert(
-    "enrollment".to_string(),
-    enr.as_ref().map(|e| e.full_json()).unwrap_or(Value::Null),
-  );
+  // P2 recert
+  let mut enrollment = enr.as_ref().map(|e| e.full_json()).unwrap_or(Value::Null);
+  carehub_learning_assign::add_row_expiry(
+    &state.pg_pool,
+    std::slice::from_mut(&mut enrollment),
+    Some(course),
+  )
+  .await;
+  res.insert("enrollment".to_string(), enrollment);
   // qbank3: the caller's own survey answers ({} if none).
   let surveys = qbank::my_surveys(&state.pg_pool, course, uid).await;
   res.insert("surveys".to_string(), surveys);
@@ -2946,6 +2954,10 @@ fn publish_problems(c: &Value, size: usize) -> Vec<String> {
   if !(0_i64..=20).contains(&num(st, "max_attempts", 0)) {
     problems.push("Set quiz attempts between 0 (unlimited) and 20.".to_string());
   }
+  // P2 recert
+  if let Some(msg) = carehub_learning_assign::recert_problem(st) {
+    problems.push(msg.to_string());
+  }
   let lessons = list(c, "lessons");
   if lessons.is_empty() {
     problems.push("Add at least one lesson.".to_string());
@@ -3243,7 +3255,7 @@ async fn report_course(
   } else {
     Vec::new()
   };
-  let rows: Vec<Value> = rows
+  let mut rows: Vec<Value> = rows
     .iter()
     .map(|r| {
       json!({
@@ -3264,6 +3276,8 @@ async fn report_course(
       })
     })
     .collect();
+  // P2 recert
+  carehub_learning_assign::add_row_expiry(&state.pg_pool, &mut rows, Some(course)).await;
   let not_started: Vec<Value> = waiting
     .iter()
     .map(|r| json!({ "uid": r.0.to_string(), "name": r.1, "email": r.2 }))
@@ -3382,7 +3396,7 @@ async fn report_person(
   .bind(uid)
   .fetch_all(&state.pg_pool)
   .await?;
-  let rows: Vec<Value> = rows
+  let mut rows: Vec<Value> = rows
     .iter()
     .map(|r| {
       json!({
@@ -3400,6 +3414,8 @@ async fn report_person(
       })
     })
     .collect();
+  // P2 recert
+  carehub_learning_assign::add_row_expiry(&state.pg_pool, &mut rows, None).await;
   Ok(json!({
     "person": { "uid": who.0.to_string(), "name": who.1, "email": who.2 },
     "rows": rows,
@@ -3424,18 +3440,34 @@ async fn reset_person(
   let uid = uid_of(body.get("uid")).ok_or_else(|| bad(PERSON_LINK_MSG))?;
   let mut tx = state.pg_pool.begin().await?;
   head_of(&mut tx, c.ws, course).await?.ok_or_else(missing)?;
+  // P2 recert: shared with renewals (carehub_learning_assign.rs).
+  let by = json!({ "by": c.uid().to_string() });
+  reset_progress(&mut tx, c.ws, course, uid, by).await?;
+  tx.commit().await?;
+  Ok(json!({ "ok": true }))
+}
+
+/// P2 recert: clears one person's progress on a course (old quiz attempts and
+/// events stay) and logs a "reset" event with `data`; false = nothing to clear.
+pub(crate) async fn reset_progress(
+  conn: &mut PgConnection,
+  ws: Uuid,
+  course: Uuid,
+  uid: i64,
+  data: Value,
+) -> Result<bool, AppError> {
   let done = sqlx::query("DELETE FROM carehub_enrollment WHERE course_id = $1 AND uid = $2")
     .bind(course)
     .bind(uid)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-  if done.rows_affected() > 0 {
-    let mut ev = Ev::new("reset", now_ms());
-    ev.data = Some(json!({ "by": c.uid().to_string() }).to_string());
-    log_event(&mut tx, c.ws, course, uid, ev).await?;
+  if done.rows_affected() == 0 {
+    return Ok(false);
   }
-  tx.commit().await?;
-  Ok(json!({ "ok": true }))
+  let mut ev = Ev::new("reset", now_ms());
+  ev.data = Some(data.to_string());
+  log_event(&mut *conn, ws, course, uid, ev).await?;
+  Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -3728,4 +3760,5 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     );
   // qbank3: question banks and survey results.
   qbank::configure(cfg);
+  crate::api::carehub_learning_drafts::configure(cfg); // drafts: review links + comments
 }

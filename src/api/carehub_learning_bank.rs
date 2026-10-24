@@ -995,8 +995,11 @@ fn check_timeline(b: &Value, at: &str, problems: &mut Vec<String>) {
   } else if items.len() > 20 {
     problems.push(format!("{} can have at most 20 entries.", who));
   }
-  if items.iter().any(|it| txt(it, "title").trim().is_empty()) {
-    problems.push(format!("{} has an entry without a title.", who));
+  if items
+    .iter()
+    .any(|it| txt(it, "date").trim().is_empty() || txt(it, "title").trim().is_empty())
+  {
+    problems.push(format!("{} has an entry without a date or title.", who));
   }
   if items
     .iter()

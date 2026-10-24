@@ -3642,5 +3642,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/api/carehub/ws/{ws}/learning/reports/people/{uid}")
         .route(web::get().to(report_person_handler)),
+    )
+    .service(
+      web::resource("/api/carehub/ws/{ws}/learning/reports/overview")
+        .route(web::get().to(crate::api::carehub_learning_overview::overview_handler)),
     );
 }

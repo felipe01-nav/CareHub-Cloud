@@ -923,10 +923,11 @@ impl Enr {
 
 /// Works out status, awaiting_ack, completed_ms and percent after a change.
 fn refresh(e: &mut Enr, st: &Settings, lessons: &[Value], now: i64) {
-  let total = lessons.len() as i64;
+  // branching: side lessons count only once opened (no side lessons: all).
+  let total = lessons.iter().filter(|l| counted(l, &e.prog)).count() as i64;
   let done = lessons
     .iter()
-    .filter(|l| e.prog.lesson_done(txt(l, "id")))
+    .filter(|l| counted(l, &e.prog) && e.prog.lesson_done(txt(l, "id")))
     .count() as i64;
   let lessons_ok = done >= total;
   let quiz_ok = st.quiz_on && e.quiz_passed;
@@ -1245,11 +1246,246 @@ async fn open_record(
 }
 
 // ---------------------------------------------------------------------------
+// branching: side lessons and "After this lesson"
+// ---------------------------------------------------------------------------
+
+/// branching: a side lesson (`branch: true`) is only opened from a button or a
+/// link; people who don't pick it skip it.
+fn is_side(lesson: &Value) -> bool {
+  flag(lesson, "branch", false)
+}
+
+/// branching: every lesson that isn't a side lesson counts; a side lesson
+/// counts once the person has opened it (it has progress: lesson_open adds an
+/// empty entry). Without side lessons every lesson counts, as before.
+fn counted(lesson: &Value, prog: &Prog) -> bool {
+  !is_side(lesson) || prog.lessons.contains_key(txt(lesson, "id"))
+}
+
+/// branching: `](#lesson-<id>)` / `](#block-<id>)` links in a text, read the
+/// same way as the link check (text_links in carehub_learning_bank).
+fn branch_text_links(text: &str, out: &mut Vec<(bool, String)>) {
+  for (marker, is_lesson) in [("](#lesson-", true), ("](#block-", false)] {
+    let mut rest = text;
+    while let Some(pos) = rest.find(marker) {
+      rest = rest.get(pos + marker.len()..).unwrap_or("");
+      let id: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect();
+      let closed = rest.get(id.len()..).is_some_and(|r| r.starts_with(')'));
+      if !id.is_empty() && closed {
+        out.push((is_lesson, id));
+      }
+    }
+  }
+}
+
+/// branching: the links in any text of a block (strings at any depth).
+fn branch_collect_links(v: &Value, out: &mut Vec<(bool, String)>) {
+  match v {
+    Value::String(s) => branch_text_links(s, out),
+    Value::Array(items) => {
+      for x in items {
+        branch_collect_links(x, out);
+      }
+    },
+    Value::Object(o) => {
+      for x in o.values() {
+        branch_collect_links(x, out);
+      }
+    },
+    _ => {},
+  }
+}
+
+fn push_once(to: &mut Vec<usize>, from: usize, j: usize) {
+  if j != from && !to.contains(&j) {
+    to.push(j);
+  }
+}
+
+/// branching: for each lesson (by index), the other lessons it leads to: lesson
+/// buttons, text links to a lesson or to one of its blocks, and "After this
+/// lesson" (`then` = a lesson id; "" and "choose" lead nowhere). An id used
+/// twice means its first lesson; empty ids are never matched.
+fn branch_edges(lessons: &[Value]) -> Vec<Vec<usize>> {
+  let mut by_lesson: HashMap<&str, usize> = HashMap::new();
+  let mut by_block: HashMap<&str, usize> = HashMap::new();
+  for (i, l) in lessons.iter().enumerate() {
+    let lid = txt(l, "id");
+    if !lid.is_empty() {
+      by_lesson.entry(lid).or_insert(i);
+    }
+    for b in list(l, "blocks") {
+      let bid = txt(b, "id");
+      if !bid.is_empty() {
+        by_block.entry(bid).or_insert(i);
+      }
+    }
+  }
+  let mut edges: Vec<Vec<usize>> = Vec::with_capacity(lessons.len());
+  for (i, l) in lessons.iter().enumerate() {
+    let mut to: Vec<usize> = Vec::new();
+    for b in list(l, "blocks") {
+      if txt(b, "type") == "buttons" {
+        for item in list(b, "items") {
+          let lid = match item.get("target") {
+            Some(t) if txt(t, "kind") == "lesson" => txt(t, "lesson_id").trim(),
+            _ => "",
+          };
+          if let Some(&j) = by_lesson.get(lid) {
+            push_once(&mut to, i, j);
+          }
+        }
+      }
+      let mut links: Vec<(bool, String)> = Vec::new();
+      branch_collect_links(b, &mut links);
+      for (is_lesson, id) in &links {
+        let at = if *is_lesson {
+          by_lesson.get(id.as_str())
+        } else {
+          by_block.get(id.as_str())
+        };
+        if let Some(&j) = at {
+          push_once(&mut to, i, j);
+        }
+      }
+    }
+    let then = match txt(l, "then").trim() {
+      "choose" => "",
+      t => t,
+    };
+    if let Some(&j) = by_lesson.get(then) {
+      push_once(&mut to, i, j);
+    }
+    edges.push(to);
+  }
+  edges
+}
+
+/// branching: whether side lesson `idx` is open in an in-order course. It
+/// never waits for the lessons above it: it's open once the person has opened
+/// it (or done it), or when something open leads to it — a lesson that isn't a
+/// side lesson and is done or has every counted lesson above it done, or
+/// another open side lesson (followed through, each lesson once).
+fn side_open(lessons: &[Value], prog: &Prog, idx: usize) -> bool {
+  let lesson = match lessons.get(idx) {
+    Some(l) => l,
+    None => return false,
+  };
+  if prog.lessons.contains_key(txt(lesson, "id")) {
+    return true;
+  }
+  let edges = branch_edges(lessons);
+  let mut seen: Vec<bool> = vec![false; lessons.len()];
+  let mut queue: Vec<usize> = Vec::new();
+  let mut above_done = true;
+  for (i, l) in lessons.iter().enumerate() {
+    let lid = txt(l, "id");
+    let done = prog.lesson_done(lid);
+    let open = if is_side(l) {
+      prog.lessons.contains_key(lid)
+    } else {
+      done || above_done
+    };
+    if open {
+      if let Some(s) = seen.get_mut(i) {
+        *s = true;
+      }
+      queue.push(i);
+    }
+    if counted(l, prog) && !done {
+      above_done = false;
+    }
+  }
+  while let Some(u) = queue.pop() {
+    let outs: &[usize] = edges.get(u).map(|e| e.as_slice()).unwrap_or(&[]);
+    for &v in outs {
+      let side = lessons.get(v).map(is_side).unwrap_or(false);
+      let fresh = seen.get(v).map(|s| !*s).unwrap_or(false);
+      if side && fresh {
+        if let Some(s) = seen.get_mut(v) {
+          *s = true;
+        }
+        queue.push(v);
+      }
+    }
+  }
+  seen.get(idx).copied().unwrap_or(false)
+}
+
+/// branching: publish checks for side lessons and "After this lesson". Only
+/// when a lesson uses them; the web runs the same checks in the same order.
+fn branch_problems(lessons: &[Value], problems: &mut Vec<String>) {
+  let used = lessons
+    .iter()
+    .any(|l| is_side(l) || !txt(l, "then").trim().is_empty());
+  if !used {
+    return;
+  }
+  let all_side = !lessons.is_empty() && lessons.iter().all(is_side);
+  if all_side {
+    problems.push("At least one lesson must not be a side lesson.".to_string());
+  }
+  let edges = branch_edges(lessons);
+  // Everything reachable from the lessons that aren't side lessons.
+  let mut seen: Vec<bool> = lessons.iter().map(|l| !is_side(l)).collect();
+  let mut queue: Vec<usize> = (0..lessons.len())
+    .filter(|i| seen.get(*i).copied().unwrap_or(false))
+    .collect();
+  while let Some(u) = queue.pop() {
+    let outs: &[usize] = edges.get(u).map(|e| e.as_slice()).unwrap_or(&[]);
+    for &v in outs {
+      let fresh = seen.get(v).map(|s| !*s).unwrap_or(false);
+      if fresh {
+        if let Some(s) = seen.get_mut(v) {
+          *s = true;
+        }
+        queue.push(v);
+      }
+    }
+  }
+  for (li, lesson) in lessons.iter().enumerate() {
+    let name = lesson_name(li, lesson);
+    if !all_side && is_side(lesson) && !seen.get(li).copied().unwrap_or(false) {
+      problems.push(format!(
+        "Nothing leads to {}. It's a side lesson, so add a button or link to it in another lesson.",
+        name
+      ));
+    }
+    let then = txt(lesson, "then").trim();
+    if !then.is_empty()
+      && then != "choose"
+      && !lessons
+        .iter()
+        .enumerate()
+        .any(|(j, l)| j != li && txt(l, "id") == then)
+    {
+      problems.push(format!(
+        "\"After this lesson\" in {} must go to another lesson in this course.",
+        name
+      ));
+    }
+    let leads = edges.get(li).map(|e| !e.is_empty()).unwrap_or(false);
+    if then == "choose" && !leads {
+      problems.push(format!(
+        "{} lets people choose, so it needs a button or link to another lesson.",
+        name
+      ));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Quiz helpers
 // ---------------------------------------------------------------------------
 
 fn all_lessons_done(lessons: &[Value], prog: &Prog) -> bool {
-  lessons.iter().all(|l| prog.lesson_done(txt(l, "id")))
+  // branching: side lessons the person hasn't opened don't count.
+  lessons
+    .iter()
+    .all(|l| !counted(l, prog) || prog.lesson_done(txt(l, "id")))
 }
 
 fn quiz_lock(
@@ -1481,14 +1717,23 @@ fn completion_block(st: &Settings, lessons: &[Value], prog: &Prog, idx: usize) -
     None => return Some(UNKNOWN_LESSON_MSG.to_string()),
   };
   if st.sequential {
-    for earlier in lessons.iter().take(idx) {
-      if !prog.lesson_done(txt(earlier, "id")) {
-        let title = txt(earlier, "title").trim();
-        return Some(if title.is_empty() {
-          "Finish the earlier lessons first.".to_string()
-        } else {
-          format!("Finish \"{}\" first.", title)
-        });
+    // branching: a side lesson never waits for the lessons above it; it needs
+    // to be opened, or led to by something open.
+    if is_side(lesson) {
+      if !side_open(lessons, prog, idx) {
+        return Some("Finish the earlier lessons first.".to_string());
+      }
+    } else {
+      for earlier in lessons.iter().take(idx) {
+        // branching: skip side lessons the person hasn't opened.
+        if counted(earlier, prog) && !prog.lesson_done(txt(earlier, "id")) {
+          let title = txt(earlier, "title").trim();
+          return Some(if title.is_empty() {
+            "Finish the earlier lessons first.".to_string()
+          } else {
+            format!("Finish \"{}\" first.", title)
+          });
+        }
       }
     }
   }
@@ -1818,7 +2063,13 @@ async fn progress(
     };
     let mut data: Option<String> = None;
     match kind {
-      "lesson_open" => {},
+      "lesson_open" => {
+        // branching: opening a side lesson makes it count (an empty progress
+        // entry); other lessons stay as before (event log only).
+        if is_side(lesson) {
+          enr.prog.lessons.entry(lesson_id.to_string()).or_default();
+        }
+      },
       "block_complete" => {
         if !has_block(lesson, block_id) {
           rejected.push(json!({ "i": i, "reason": UNKNOWN_BLOCK_MSG }));
@@ -2995,6 +3246,8 @@ fn publish_problems(c: &Value, size: usize) -> Vec<String> {
   }
   // qbank3: buttons and text links must go to a lesson or block of this course.
   qbank::link_problems(c, &mut problems);
+  // branching: side lessons and "After this lesson".
+  branch_problems(lessons, &mut problems);
   let quiz = match c.get("quiz") {
     Some(v) if v.is_object() => v,
     _ => &empty,

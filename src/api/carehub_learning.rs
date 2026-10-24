@@ -3761,4 +3761,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
   // qbank3: question banks and survey results.
   qbank::configure(cfg);
   crate::api::carehub_learning_drafts::configure(cfg); // drafts: review links + comments
+  // templates: block templates (save blocks and reuse them).
+  crate::api::carehub_learning_templates::configure(cfg);
 }
